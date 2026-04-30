@@ -17,7 +17,7 @@ to many literal multi-column `VALUES` clauses being parsed/applied.
 
 A reproduction script is included at `repro/doltlite_2000_row_ceiling.sh`.
 
-Filed upstream: *[fill in issue link after filing]*
+Filed upstream: https://github.com/dolthub/doltlite/issues/710
 
 ### Impact on dolt-replay
 
