@@ -1,0 +1,5 @@
+/dolt-replay
+*.dl
+*.db
+*.sqlite
+/replay-*.sql
