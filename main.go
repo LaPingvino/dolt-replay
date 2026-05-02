@@ -321,6 +321,12 @@ var (
 	reDropIndex      = regexp.MustCompile("(?is)ALTER TABLE ([`\"]?\\w+[`\"]?) DROP INDEX ([`\"]?\\w+[`\"]?);")
 	reAfterClause    = regexp.MustCompile(`(?i)\s+AFTER\s+\x60\w+\x60`)
 	reAutoIncrement  = regexp.MustCompile(`(?i)\s+AUTO_INCREMENT\b`)
+	reAutoIncOption  = regexp.MustCompile(`(?i)\s+AUTO_INCREMENT=\d+\b`)
+	reDecimal        = regexp.MustCompile(`(?i)\bdecimal\s*\(\d+\s*,\s*\d+\)`)
+	// MySQL's "ON UPDATE CURRENT_TIMESTAMP" column attribute (and other ON
+	// UPDATE expressions on column defs) — SQLite has no inline equivalent.
+	// Stripped; if needed, callers must add a trigger.
+	reOnUpdate       = regexp.MustCompile(`(?i)\s+ON\s+UPDATE\s+\w+(\s*\([^)]*\))?`)
 	reCreateTbl      = regexp.MustCompile("(?i)\\bCREATE TABLE ([`\"])")
 	reInsertInto     = regexp.MustCompile("(?i)\\bINSERT INTO ([`\"])")
 	reSet       = regexp.MustCompile(`(?is)\bset\s*\([^)]*\)`)
@@ -366,6 +372,10 @@ func translateForSQLite(sql string) string {
 	sql = reAddPK.ReplaceAllString(sql, "-- skipped: ADD PRIMARY KEY (sqlite limitation)")
 	sql = reDropIndex.ReplaceAllString(sql, "DROP INDEX IF EXISTS $2;")
 	sql = reAutoIncrement.ReplaceAllString(sql, "")
+	sql = reAutoIncOption.ReplaceAllString(sql, "")
+	sql = reDecimal.ReplaceAllString(sql, "NUMERIC")
+	sql = reOnUpdate.ReplaceAllString(sql, "")
+	sql = extractInlineKeys(sql)
 	// Replay tolerance: dolt history may DROP+CREATE the same table later, or
 	// re-emit a row that's already present after we no-op'd a schema change.
 	// Make CREATE/INSERT idempotent so transient state mismatches don't halt
@@ -442,6 +452,147 @@ func mysqlEscapesToSQLite(sql string) string {
 	return b.String()
 }
 
+// extractInlineKeys rewrites MySQL inline `KEY name (cols)` and
+// `UNIQUE KEY name (cols)` clauses inside CREATE TABLE bodies into separate
+// CREATE [UNIQUE] INDEX statements emitted after the table.
+//
+// SQLite/doltlite reject these inline; without this pass any CREATE TABLE
+// containing an inline KEY halts the chunk and (worse) the table is never
+// created, so every later commit referring to it fails with "no such table".
+func extractInlineKeys(sql string) string {
+	var out strings.Builder
+	out.Grow(len(sql) + 64)
+	i := 0
+	for i < len(sql) {
+		// Find next CREATE TABLE
+		j := strings.Index(strings.ToUpper(sql[i:]), "CREATE TABLE")
+		if j < 0 {
+			out.WriteString(sql[i:])
+			break
+		}
+		j += i
+		out.WriteString(sql[i:j])
+
+		// Locate the opening '(' of the column-definition body
+		open := strings.IndexByte(sql[j:], '(')
+		if open < 0 {
+			out.WriteString(sql[j:])
+			break
+		}
+		open += j
+
+		// Walk balanced parens to find the matching ')'
+		depth := 0
+		end := -1
+		for k := open; k < len(sql); k++ {
+			switch sql[k] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					end = k
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end < 0 {
+			out.WriteString(sql[j:])
+			break
+		}
+
+		header := sql[j : open+1]
+		body := sql[open+1 : end]
+		tail := sql[end:] // ");" plus rest
+
+		// Pull table name from the header for the index DDL.
+		tableName := ""
+		if m := regexp.MustCompile("(?i)CREATE TABLE\\s+(IF NOT EXISTS\\s+)?[`\"]?(\\w+)[`\"]?").FindStringSubmatch(header); m != nil {
+			tableName = m[2]
+		}
+
+		keptParts := []string{}
+		var indexes []string
+		for _, raw := range splitTopLevel(body, ',') {
+			t := strings.TrimSpace(raw)
+			low := strings.ToLower(t)
+			if strings.HasPrefix(low, "unique key") || strings.HasPrefix(low, "key ") || low == "key" {
+				if idx := makeIndexFromKey(t, tableName); idx != "" {
+					indexes = append(indexes, idx)
+					continue
+				}
+			}
+			keptParts = append(keptParts, raw)
+		}
+
+		out.WriteString(header)
+		out.WriteString(strings.Join(keptParts, ","))
+		// Find end of statement (the ';' after `tail`'s leading ')')
+		semi := strings.IndexByte(tail, ';')
+		if semi < 0 {
+			out.WriteString(tail)
+			i = len(sql)
+			continue
+		}
+		out.WriteString(tail[:semi+1])
+		for _, idx := range indexes {
+			out.WriteByte('\n')
+			out.WriteString(idx)
+		}
+		i = end + semi + 1
+	}
+	return out.String()
+}
+
+// splitTopLevel splits `s` on `sep` ignoring separators inside parens or
+// inside single/double-quoted strings.
+func splitTopLevel(s string, sep byte) []string {
+	var parts []string
+	depth := 0
+	inSQ, inDQ, inBT := false, false, false
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\\' && (inSQ || inDQ):
+			i++ // skip escaped char
+			continue
+		case c == '\'' && !inDQ && !inBT:
+			inSQ = !inSQ
+		case c == '"' && !inSQ && !inBT:
+			inDQ = !inDQ
+		case c == '`' && !inSQ && !inDQ:
+			inBT = !inBT
+		case !inSQ && !inDQ && !inBT && c == '(':
+			depth++
+		case !inSQ && !inDQ && !inBT && c == ')':
+			depth--
+		case !inSQ && !inDQ && !inBT && depth == 0 && c == sep:
+			parts = append(parts, s[start:i])
+			start = i + 1
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}
+
+var reKeyClause = regexp.MustCompile("(?is)^(UNIQUE\\s+)?KEY\\s+[`\"]?(\\w+)[`\"]?\\s*\\((.+)\\)\\s*$")
+
+func makeIndexFromKey(clause, table string) string {
+	m := reKeyClause.FindStringSubmatch(strings.TrimSpace(clause))
+	if m == nil || table == "" {
+		return ""
+	}
+	uniq := ""
+	if strings.TrimSpace(m[1]) != "" {
+		uniq = "UNIQUE "
+	}
+	return fmt.Sprintf("CREATE %sINDEX IF NOT EXISTS `%s_%s` ON `%s` (%s);",
+		uniq, table, m[2], table, m[3])
+}
+
 func translateForDolt(sql string) string {
 	// SQLite → Dolt (limited): swap double-quote idents → backticks
 	return strings.ReplaceAll(sql, `"`, "`")
@@ -471,7 +622,26 @@ func applyToDolt(repo, sql, msg, author, email, date string) error {
 // wrap each chunk in BEGIN/COMMIT to keep failures localized and memory bounded.
 const chunkSize = 1500
 
-func applyToDoltlite(db, sql, msg, author, email, date string) error {
+// repairCtx carries source-side context that lets applyToDoltlite recover
+// from "no such table" errors by fetching the missing schema from the source
+// dolt repo at the failing commit and applying it before retrying the chunk.
+// Empty values disable repair.
+type repairCtx struct {
+	srcKind, src, sourceCommit string
+}
+
+var (
+	reNoSuchTable = regexp.MustCompile(`(?i)no such table:\s*"?(\w+)"?`)
+	// SQLite refuses ALTER TABLE … DROP COLUMN when the column is part of the
+	// primary key. The error doesn't name the table, so we recover the (table,
+	// column) pair from the chunk's own ALTER statement instead.
+	reDropPKColErr  = regexp.MustCompile(`(?i)cannot drop PRIMARY KEY column:?\s*"?(\w+)"?`)
+	// MySQL accepts both `ALTER TABLE x DROP COLUMN y` and the shorthand
+	// `ALTER TABLE x DROP y`; dolt diff emits the shorthand.
+	reAlterDropCol  = regexp.MustCompile("(?i)ALTER TABLE [`\"]?(\\w+)[`\"]? DROP (?:COLUMN )?[`\"]?(\\w+)[`\"]?")
+)
+
+func applyToDoltlite(db, sql, msg, author, email, date string, rc repairCtx) error {
 	stmts := splitStatements(sql)
 	fmt.Fprintf(os.Stderr, "    [%d statements → %d chunks of <=%d, BEGIN/COMMIT wrapped]\n",
 		len(stmts), (len(stmts)+chunkSize-1)/chunkSize, chunkSize)
@@ -480,22 +650,66 @@ func applyToDoltlite(db, sql, msg, author, email, date string) error {
 		if end > len(stmts) {
 			end = len(stmts)
 		}
-		f, err := os.CreateTemp("", "replay-*.sql")
-		if err != nil {
-			return err
+		const maxRepair = 5
+		var lastErr error
+		for attempt := 0; attempt <= maxRepair; attempt++ {
+			f, err := os.CreateTemp("", "replay-*.sql")
+			if err != nil {
+				return err
+			}
+			io.WriteString(f, "BEGIN;\n")
+			for _, s := range stmts[i:end] {
+				io.WriteString(f, s+";\n")
+			}
+			io.WriteString(f, "COMMIT;\n")
+			f.Close()
+			out, errs, err := run("", "", "doltlite", "-bail", db, "-cmd", ".read "+f.Name())
+			os.Remove(f.Name())
+			if err == nil {
+				lastErr = nil
+				break
+			}
+			lastErr = fmt.Errorf("doltlite chunk %d-%d: %v\n%s\n%s", i, end, err, errs, truncate(out, 300))
+
+			if rc.srcKind != "dolt" || rc.src == "" || rc.sourceCommit == "" {
+				return lastErr
+			}
+			combined := errs + out
+			if m := reNoSuchTable.FindStringSubmatch(combined); m != nil {
+				missing := m[1]
+				fmt.Fprintf(os.Stderr, "    [repair] missing table %q — fetching schema from source @ %s\n",
+					missing, short10(rc.sourceCommit))
+				if err := bootstrapTableFromDolt(db, rc.src, rc.sourceCommit, missing); err != nil {
+					return fmt.Errorf("schema bootstrap for %q failed: %v (original: %v)", missing, err, lastErr)
+				}
+				continue
+			}
+			if reDropPKColErr.MatchString(combined) {
+				// Find the offending ALTER in this chunk to learn which table/col,
+				// then rebuild the table from source's post-commit schema and
+				// strip the ALTER from the chunk so the retry doesn't re-trigger.
+				var tbl, col string
+				for k := i; k < end; k++ {
+					if m := reAlterDropCol.FindStringSubmatch(stmts[k]); m != nil {
+						tbl, col = m[1], m[2]
+						stmts[k] = fmt.Sprintf("-- rebuilt: ALTER TABLE %s DROP COLUMN %s", tbl, col)
+						break
+					}
+				}
+				if tbl == "" {
+					return lastErr
+				}
+				fmt.Fprintf(os.Stderr, "    [repair] DROP PK column %s.%s — rebuilding table from source @ %s\n",
+					tbl, col, short10(rc.sourceCommit))
+				if err := rebuildTableFromDolt(db, rc.src, rc.sourceCommit, tbl); err != nil {
+					return fmt.Errorf("table rebuild for %q failed: %v (original: %v)", tbl, err, lastErr)
+				}
+				continue
+			}
+			return lastErr
 		}
-		// CREATE TABLE can't run inside SQLite transactions if other tx is
-		// open — but a fresh DB has no open tx, so safe. We always wrap.
-		io.WriteString(f, "BEGIN;\n")
-		for _, s := range stmts[i:end] {
-			io.WriteString(f, s+";\n")
-		}
-		io.WriteString(f, "COMMIT;\n")
-		f.Close()
-		out, errs, err := run("", "", "doltlite", "-bail", db, "-cmd", ".read "+f.Name())
-		os.Remove(f.Name())
-		if err != nil {
-			return fmt.Errorf("doltlite chunk %d-%d: %v\n%s\n%s", i, end, err, errs, truncate(out, 300))
+		if lastErr != nil {
+			return lastErr
 		}
 	}
 	commitSQL := fmt.Sprintf("SELECT dolt_commit('-A', '-m', '%s', '--author', '%s <%s>', '--date', '%s');",
@@ -509,6 +723,175 @@ func applyToDoltlite(db, sql, msg, author, email, date string) error {
 		return fmt.Errorf("doltlite commit: %v\n%s", err, errs)
 	}
 	return nil
+}
+
+// bootstrapTableFromDolt asks the source dolt repo for `SHOW CREATE TABLE
+// <table> AS OF '<commit>'`, translates it for SQLite, and applies on the
+// target. Used when an apply chunk hits "no such table" because an earlier
+// schema-changing commit was filtered to no-ops.
+func bootstrapTableFromDolt(db, repo, commit, table string) error {
+	q := fmt.Sprintf("SHOW CREATE TABLE `%s` AS OF '%s'", table, commit)
+	out, errs, err := run(repo, "", "dolt", "sql", "-r", "csv", "-q", q)
+	if err != nil {
+		return fmt.Errorf("dolt sql: %v\n%s", err, errs)
+	}
+	r := csv.NewReader(strings.NewReader(out))
+	r.FieldsPerRecord = -1
+	rows, err := r.ReadAll()
+	if err != nil || len(rows) < 2 || len(rows[1]) < 2 {
+		return fmt.Errorf("unexpected SHOW CREATE TABLE output: %q", out)
+	}
+	createSQL := rows[1][1] + ";\n"
+	createSQL = translateForSQLite(createSQL)
+	if _, errs, err := run("", "", "doltlite", db, createSQL); err != nil {
+		return fmt.Errorf("create on target: %v\n%s\nSQL: %s", err, errs, truncate(createSQL, 400))
+	}
+	return nil
+}
+
+// rebuildTableFromDolt rebuilds an existing target table to match the source's
+// post-commit schema, copying rows from the existing target table for columns
+// that survive in the new schema. Used to emulate ALTERs that SQLite refuses
+// (DROP PK column, MODIFY COLUMN, change PK set).
+//
+// Procedure: CREATE <tbl>__rebuild with new schema, INSERT INTO <tbl>__rebuild
+// (cols∩) SELECT cols∩ FROM <tbl>, DROP <tbl>, ALTER RENAME __rebuild → <tbl>.
+// Wrapped in a transaction so a failure leaves the original table intact.
+func rebuildTableFromDolt(db, repo, commit, table string) error {
+	q := fmt.Sprintf("SHOW CREATE TABLE `%s` AS OF '%s'", table, commit)
+	out, errs, err := run(repo, "", "dolt", "sql", "-r", "csv", "-q", q)
+	if err != nil {
+		return fmt.Errorf("dolt sql: %v\n%s", err, errs)
+	}
+	r := csv.NewReader(strings.NewReader(out))
+	r.FieldsPerRecord = -1
+	rows, err := r.ReadAll()
+	if err != nil || len(rows) < 2 || len(rows[1]) < 2 {
+		return fmt.Errorf("unexpected SHOW CREATE TABLE output: %q", out)
+	}
+	rebuildName := table + "__rebuild"
+	createSQL := translateForSQLite(rows[1][1] + ";\n")
+	// Rename the new table inside the CREATE so it doesn't collide.
+	createSQL = strings.Replace(createSQL,
+		fmt.Sprintf("CREATE TABLE IF NOT EXISTS \"%s\"", table),
+		fmt.Sprintf("CREATE TABLE \"%s\"", rebuildName), 1)
+
+	newCols, err := tableColumns(db, rebuildName, createSQL) // peek from SQL, table doesn't exist yet
+	if err != nil {
+		return err
+	}
+	oldCols, err := tableColumns(db, table, "")
+	if err != nil {
+		return err
+	}
+	common := intersect(newCols, oldCols)
+	if len(common) == 0 {
+		return fmt.Errorf("no overlapping columns between old %v and new %v", oldCols, newCols)
+	}
+	colList := strings.Join(quoteAll(common, "\""), ",")
+	migration := fmt.Sprintf(`BEGIN;
+%s
+INSERT INTO "%s" (%s) SELECT %s FROM "%s";
+DROP TABLE "%s";
+ALTER TABLE "%s" RENAME TO "%s";
+COMMIT;`, createSQL, rebuildName, colList, colList, table, table, rebuildName, table)
+	if _, errs, err := run("", "", "doltlite", db, migration); err != nil {
+		return fmt.Errorf("apply rebuild: %v\n%s\nSQL: %s", err, errs, truncate(migration, 600))
+	}
+	return nil
+}
+
+// tableColumns returns the column names of `table` in `db`. If sqlSnippet is
+// non-empty, parse columns from the CREATE TABLE in the snippet instead of
+// querying the live table (used when the table doesn't exist on target yet).
+func tableColumns(db, table, sqlSnippet string) ([]string, error) {
+	if sqlSnippet != "" {
+		// Find balanced () after CREATE TABLE … and split top-level commas;
+		// take the leading word of each part as the column name (ignoring
+		// CONSTRAINT/PRIMARY KEY/etc lines).
+		open := strings.IndexByte(sqlSnippet, '(')
+		if open < 0 {
+			return nil, fmt.Errorf("no body in CREATE TABLE")
+		}
+		depth := 0
+		end := -1
+		for i := open; i < len(sqlSnippet); i++ {
+			switch sqlSnippet[i] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					end = i
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end < 0 {
+			return nil, fmt.Errorf("unbalanced () in CREATE TABLE")
+		}
+		var cols []string
+		for _, p := range splitTopLevel(sqlSnippet[open+1:end], ',') {
+			t := strings.TrimSpace(p)
+			low := strings.ToLower(t)
+			if strings.HasPrefix(low, "primary key") || strings.HasPrefix(low, "unique") ||
+				strings.HasPrefix(low, "constraint") || strings.HasPrefix(low, "foreign key") ||
+				strings.HasPrefix(low, "key ") || strings.HasPrefix(low, "check") {
+				continue
+			}
+			name := t
+			if i := strings.IndexAny(t, " \t"); i > 0 {
+				name = t[:i]
+			}
+			name = strings.Trim(name, "`\"")
+			if name != "" {
+				cols = append(cols, name)
+			}
+		}
+		return cols, nil
+	}
+	out, errs, err := run("", "", "doltlite", "-csv", "-header", db,
+		fmt.Sprintf("SELECT name FROM pragma_table_info('%s')", table))
+	if err != nil {
+		return nil, fmt.Errorf("pragma_table_info: %v\n%s", err, errs)
+	}
+	cr := csv.NewReader(strings.NewReader(out))
+	rows, err := cr.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) < 2 {
+		return nil, fmt.Errorf("table %q has no columns (or doesn't exist)", table)
+	}
+	cols := make([]string, 0, len(rows)-1)
+	for _, r := range rows[1:] {
+		cols = append(cols, r[0])
+	}
+	return cols, nil
+}
+
+func intersect(a, b []string) []string {
+	bs := map[string]bool{}
+	for _, x := range b {
+		bs[x] = true
+	}
+	var out []string
+	for _, x := range a {
+		if bs[x] {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func quoteAll(ss []string, q string) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = q + s + q
+	}
+	return out
 }
 
 // splitStatements naively splits on `;` followed by newline. Good enough for
@@ -625,7 +1008,8 @@ func main() {
 			if *dstKind == "dolt" {
 				err = applyToDolt(*dst, sql, c.Message, c.Author, c.Email, c.Date)
 			} else {
-				err = applyToDoltlite(*dst, sql, c.Message, c.Author, c.Email, c.Date)
+				err = applyToDoltlite(*dst, sql, c.Message, c.Author, c.Email, c.Date,
+					repairCtx{srcKind: *srcKind, src: *src, sourceCommit: c.Hash})
 			}
 			if err != nil {
 				if *keepGo {
