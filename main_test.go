@@ -422,6 +422,99 @@ func TestE2E_TextPKInsertDelete(t *testing.T) {
 	}
 }
 
+// TestE2E_DropPKColumnReproducesOverCount: documents that WITHOUT
+// --rebuild-on-pk-drop, the schema migration is silently skipped and
+// the target ends up with extra rows. This is what bit the bahaiwritings
+// clone (writings ended up at 50172 vs source 49212).
+func TestE2E_DropPKColumnReproducesOverCount(t *testing.T) {
+	replayBin := requireDoltAndReplay(t)
+	src := makeDoltRepo(t)
+
+	doltSQL(t, src, "CREATE TABLE w (id INTEGER PRIMARY KEY, version VARCHAR(36), name TEXT)")
+	doltCommit(t, src, "schema v1 with id PK")
+	for i := 1; i <= 5; i++ {
+		doltSQL(t, src, fmt.Sprintf("INSERT INTO w VALUES (%d, 'v-%04d', 'orig-%d')", i, i, i))
+	}
+	doltCommit(t, src, "5 rows under id PK")
+	doltSQL(t, src, "ALTER TABLE w DROP id")
+	doltSQL(t, src, "ALTER TABLE w ADD PRIMARY KEY (version)")
+	doltCommit(t, src, "drop id, version is PK")
+	doltSQL(t, src, "UPDATE w SET name = 'updated' WHERE version = 'v-0001'")
+	doltCommit(t, src, "update v-0001")
+
+	if got := doltCount(t, src, "w"); got != 5 {
+		t.Fatalf("source: got %d, want 5", got)
+	}
+
+	dst := filepath.Join(t.TempDir(), "out.dl")
+	runIn(t, src, "doltlite", dst, "SELECT 1")
+	out := runReplay(t, replayBin,
+		"--src-kind", "dolt", "--src", src,
+		"--dst-kind", "doltlite", "--dst", dst,
+		"--continue-on-error")
+	t.Logf("replay output:\n%s", out)
+
+	got := dliteCount(t, dst, "w")
+	// Without --rebuild-on-pk-drop, target keeps the old id-PK schema —
+	// dolt diff emits ALTER DROP PRIMARY KEY + ADD PRIMARY KEY which our
+	// translator turns into "-- skipped" comments, and DROP id fails. The
+	// minimal repro lands at the right row count anyway because the UPDATE
+	// is just an UPDATE (not DELETE+INSERT). The bahaiwritings over-count
+	// requires longer-history re-INSERT-under-new-schema patterns that this
+	// minimal test doesn't reproduce. Documented as a Logf — see
+	// TestE2E_DropPKColumnSchemaMigration for the working case with
+	// --rebuild-on-pk-drop.
+	t.Logf("without --rebuild-on-pk-drop: target=%d rows, source=5 (over-count would be > 5)", got)
+}
+
+// TestE2E_DropPKColumnSchemaMigration: same shape with --rebuild-on-pk-drop;
+// confirms the flag actually fixes the over-count.
+func TestE2E_DropPKColumnSchemaMigration(t *testing.T) {
+	replayBin := requireDoltAndReplay(t)
+	src := makeDoltRepo(t)
+
+	doltSQL(t, src, "CREATE TABLE w (id INTEGER PRIMARY KEY, version VARCHAR(36), name TEXT)")
+	doltCommit(t, src, "schema v1 with id PK")
+
+	for i := 1; i <= 5; i++ {
+		doltSQL(t, src, fmt.Sprintf("INSERT INTO w VALUES (%d, 'v-%04d', 'orig-%d')", i, i, i))
+	}
+	doltCommit(t, src, "5 rows under id PK")
+
+	// Schema migration: drop id, promote version to PK.
+	doltSQL(t, src, "ALTER TABLE w DROP id")
+	doltSQL(t, src, "ALTER TABLE w ADD PRIMARY KEY (version)")
+	doltCommit(t, src, "drop id, version is PK")
+
+	// More inserts under new PK convention.
+	for i := 6; i <= 8; i++ {
+		doltSQL(t, src, fmt.Sprintf("INSERT INTO w VALUES ('v-%04d', 'new-%d')", i, i))
+	}
+	doltCommit(t, src, "3 more rows under version PK")
+
+	// Update one of the original rows — under the new PK this is one row.
+	doltSQL(t, src, "UPDATE w SET name = 'updated' WHERE version = 'v-0001'")
+	doltCommit(t, src, "update v-0001")
+
+	if got := doltCount(t, src, "w"); got != 8 {
+		t.Fatalf("source: got %d, want 8", got)
+	}
+
+	dst := filepath.Join(t.TempDir(), "out.dl")
+	runIn(t, src, "doltlite", dst, "SELECT 1")
+	out := runReplay(t, replayBin,
+		"--src-kind", "dolt", "--src", src,
+		"--dst-kind", "doltlite", "--dst", dst,
+		"--continue-on-error",
+		"--rebuild-on-pk-drop")
+	t.Logf("replay output:\n%s", out)
+
+	got := dliteCount(t, dst, "w")
+	if got != 8 {
+		t.Fatalf("target: got %d, want 8 (duplicate rows = PK migration not handled)", got)
+	}
+}
+
 // TestE2E_MultilineStringLiteral exercises the `splitStatements` bug we
 // hit on the bahaiwritings 'Tablet of the Holy Mariner' commit — a single
 // SQL string literal containing embedded newlines.

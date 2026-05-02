@@ -946,7 +946,7 @@ func main() {
 		limit   = flag.Int("limit", 0, "Cap commits to walk in source order (0 = all, oldest→newest)")
 		dryRun  = flag.Bool("dry-run", false, "Print SQL, do not apply")
 		keepGo  = flag.Bool("continue-on-error", false, "Log apply failures and continue instead of aborting")
-		rebuild = flag.Bool("rebuild-on-pk-drop", false, "EXPERIMENTAL: emulate ALTER DROP PK-column via full table rebuild (currently has bugs)")
+		rebuild = flag.Bool("rebuild-on-pk-drop", true, "Emulate ALTER DROP PK-column via full table rebuild (recommended; pass --rebuild-on-pk-drop=false to disable)")
 	)
 	flag.Parse()
 	for _, p := range []struct{ name, val string }{
