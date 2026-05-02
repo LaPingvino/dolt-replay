@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // ---------- shell helpers ----------
@@ -626,8 +627,15 @@ const chunkSize = 1500
 // from "no such table" errors by fetching the missing schema from the source
 // dolt repo at the failing commit and applying it before retrying the chunk.
 // Empty values disable repair.
+//
+// The schema-bootstrap path (no such table) is on by default; the
+// table-rebuild path (DROP PK column → rebuild table) is gated behind
+// rebuild and off by default because the current implementation has
+// known bugs that cascade into duplicate-column / quote errors on
+// follow-up commits.
 type repairCtx struct {
 	srcKind, src, sourceCommit string
+	rebuild                    bool
 }
 
 var (
@@ -663,8 +671,13 @@ func applyToDoltlite(db, sql, msg, author, email, date string, rc repairCtx) err
 			}
 			io.WriteString(f, "COMMIT;\n")
 			f.Close()
+			t0 := time.Now()
 			out, errs, err := run("", "", "doltlite", "-bail", db, "-cmd", ".read "+f.Name())
+			dt := time.Since(t0)
 			os.Remove(f.Name())
+			if dt > 500*time.Millisecond {
+				fmt.Fprintf(os.Stderr, "      chunk[%d-%d] apply %.2fs\n", i, end, dt.Seconds())
+			}
 			if err == nil {
 				lastErr = nil
 				break
@@ -684,7 +697,7 @@ func applyToDoltlite(db, sql, msg, author, email, date string, rc repairCtx) err
 				}
 				continue
 			}
-			if reDropPKColErr.MatchString(combined) {
+			if rc.rebuild && reDropPKColErr.MatchString(combined) {
 				// Find the offending ALTER in this chunk to learn which table/col,
 				// then rebuild the table from source's post-commit schema and
 				// strip the ALTER from the chunk so the retry doesn't re-trigger.
@@ -714,7 +727,13 @@ func applyToDoltlite(db, sql, msg, author, email, date string, rc repairCtx) err
 	}
 	commitSQL := fmt.Sprintf("SELECT dolt_commit('-A', '-m', '%s', '--author', '%s <%s>', '--date', '%s');",
 		strings.ReplaceAll(msg, "'", "''"), author, email, date)
-	if out, errs, err := run("", "", "doltlite", db, commitSQL); err != nil {
+	tc0 := time.Now()
+	out, errs, err := run("", "", "doltlite", db, commitSQL)
+	dtc := time.Since(tc0)
+	if dtc > 500*time.Millisecond {
+		fmt.Fprintf(os.Stderr, "      dolt_commit %.2fs\n", dtc.Seconds())
+	}
+	if err != nil {
 		// All of the diff translated away to "-- skipped" comments; no working
 		// set delta to commit. Treat as benign no-op so the walk can continue.
 		if strings.Contains(errs+out, "nothing to commit") {
@@ -927,6 +946,7 @@ func main() {
 		limit   = flag.Int("limit", 0, "Cap commits to walk in source order (0 = all, oldest→newest)")
 		dryRun  = flag.Bool("dry-run", false, "Print SQL, do not apply")
 		keepGo  = flag.Bool("continue-on-error", false, "Log apply failures and continue instead of aborting")
+		rebuild = flag.Bool("rebuild-on-pk-drop", false, "EXPERIMENTAL: emulate ALTER DROP PK-column via full table rebuild (currently has bugs)")
 	)
 	flag.Parse()
 	for _, p := range []struct{ name, val string }{
@@ -1009,7 +1029,7 @@ func main() {
 				err = applyToDolt(*dst, sql, c.Message, c.Author, c.Email, c.Date)
 			} else {
 				err = applyToDoltlite(*dst, sql, c.Message, c.Author, c.Email, c.Date,
-					repairCtx{srcKind: *srcKind, src: *src, sourceCommit: c.Hash})
+					repairCtx{srcKind: *srcKind, src: *src, sourceCommit: c.Hash, rebuild: *rebuild})
 			}
 			if err != nil {
 				if *keepGo {
