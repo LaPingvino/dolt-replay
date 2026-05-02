@@ -259,21 +259,15 @@ func applyToDolt(repo, sql, msg, author, email, date string) error {
 	return nil
 }
 
-// chunkSize: split many INSERTs into batches. doltlite v0.9.0 silently drops
-// earlier statements past ~2000 in autocommit mode unless wrapped in a single
-// BEGIN/COMMIT. We chunk + wrap each chunk in a transaction defensively; with
-// the wrap a single chunk could be the entire diff, but staying small keeps
-// failures localized.
+// chunkSize: split many INSERTs into batches. The historical reason was the
+// v0.9.0 row-loss bug (fixed in v0.9.1, see KNOWN_ISSUES.md); we still chunk +
+// wrap each chunk in BEGIN/COMMIT to keep failures localized and memory bounded.
 const chunkSize = 1500
 
 func applyToDoltlite(db, sql, msg, author, email, date string) error {
 	stmts := splitStatements(sql)
 	fmt.Fprintf(os.Stderr, "    [%d statements → %d chunks of <=%d, BEGIN/COMMIT wrapped]\n",
 		len(stmts), (len(stmts)+chunkSize-1)/chunkSize, chunkSize)
-	if len(stmts) > 2000 {
-		fmt.Fprintln(os.Stderr, "    WARNING: doltlite v0.9.0 silently drops rows past ~2000 INSERT VALUES "+
-			"(see KNOWN_ISSUES.md). Result will be incomplete.")
-	}
 	for i := 0; i < len(stmts); i += chunkSize {
 		end := i + chunkSize
 		if end > len(stmts) {

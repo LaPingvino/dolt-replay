@@ -1,6 +1,15 @@
 # Known Issues
 
-## doltlite v0.9.0: ~2000-row ceiling on bulk INSERT VALUES via `.read`
+## ✅ Fixed in doltlite v0.9.1
+
+The bulk-INSERT row-loss bug below was fixed upstream in
+[v0.9.1](https://github.com/dolthub/doltlite/releases/tag/v0.9.1)
+(release notes: "Bulk `.read INSERT VALUES` row loss (#713)"). Verified
+locally with the original 5000-row repro: all 5000 rows persist in both
+autocommit and `BEGIN; ... COMMIT;`-wrapped modes. The notes below are
+kept for historical reference; users on v0.9.0 should upgrade.
+
+## doltlite v0.9.0 (fixed in v0.9.1): ~2000-row ceiling on bulk INSERT VALUES via `.read`
 
 When applying many `INSERT INTO ... VALUES (...)` statements to a doltlite
 database via `.read file.sql`, only the last ~167-1900 rows persist (count
