@@ -1,5 +1,23 @@
 # Known Issues
 
+## SQLite/doltlite DDL gaps (full-clone limitation)
+
+When replaying `dolt → doltlite`, several MySQL DDLs have no direct
+SQLite/doltlite equivalent and require a full table rebuild (CREATE
+new table, copy data, DROP old, RENAME). dolt-replay currently
+**skips** these statements with an inline `-- skipped` comment so the
+walk doesn't halt, but the schema then drifts from source:
+
+- `ALTER TABLE … MODIFY COLUMN …`
+- `ALTER TABLE … DROP PRIMARY KEY` / `ADD PRIMARY KEY`
+- `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY …`
+- `ALTER TABLE … DROP COLUMN <pk_col>` (errors at apply time;
+  surfaces as a `--continue-on-error` failure rather than a silent skip)
+
+For a faithful clone, run with `--continue-on-error` and audit the
+final schema against `dolt --schema-only dump` of the source. A future
+version could implement schema-rebuild emulation for these cases.
+
 ## ✅ Fixed in doltlite v0.9.1
 
 The bulk-INSERT row-loss bug below was fixed upstream in

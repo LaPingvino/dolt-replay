@@ -53,6 +53,7 @@ func run(dir string, stdin string, prog string, args ...string) (string, string,
 
 type Commit struct {
 	Hash, Author, Email, Date, Message string
+	Parent                             string // empty for root commits
 }
 
 // ---------- source readers ----------
@@ -76,43 +77,131 @@ func parseCommitCSV(s string) ([]Commit, error) {
 		return -1
 	}
 	hH, aH, eH, dH, mH := col("commit_hash"), col("committer"), col("email"), col("date"), col("message")
+	pH := col("parent_hash") // -1 if absent
 	out := make([]Commit, 0, len(rows)-1)
 	for _, r := range rows[1:] {
-		out = append(out, Commit{r[hH], r[aH], r[eH], r[dH], r[mH]})
+		c := Commit{Hash: r[hH], Author: r[aH], Email: r[eH], Date: r[dH], Message: r[mH]}
+		if pH >= 0 {
+			c.Parent = r[pH]
+		}
+		out = append(out, c)
 	}
 	return out, nil
 }
 
+// doltLog returns commits in chronological order (oldest first), each with its
+// first-parent hash (or "" for the root commit). limit==0 means unlimited.
 func doltLog(repo string, limit int) ([]Commit, error) {
-	sql := fmt.Sprintf("SELECT commit_hash, committer, email, date, message FROM dolt_log ORDER BY date DESC LIMIT %d", limit+1)
+	limitClause := ""
+	if limit > 0 {
+		// +1 because for "last N" callers want N child diffs, which need N+1
+		// commits (parent + N children). The chronological walk handles parent
+		// via the join below, so the +1 just ensures we don't strand a child.
+		limitClause = fmt.Sprintf(" LIMIT %d", limit+1)
+	}
+	// LEFT JOIN: root commit has no row in dolt_commit_ancestors, so parent_hash → NULL → "".
+	sql := "SELECT l.commit_hash, l.committer, l.email, l.date, l.message, " +
+		"COALESCE(a.parent_hash, '') AS parent_hash " +
+		"FROM dolt_log l LEFT JOIN dolt_commit_ancestors a " +
+		"ON a.commit_hash = l.commit_hash AND a.parent_index = 0 " +
+		"ORDER BY l.date ASC" + limitClause
 	out, errs, err := run(repo, "", "dolt", "sql", "-r", "csv", "-q", sql)
 	if err != nil {
 		return nil, fmt.Errorf("dolt log: %v\n%s", err, errs)
 	}
-	cs, err := parseCommitCSV(out)
-	if err != nil {
-		return nil, err
-	}
-	// reverse → oldest first
-	for i, j := 0, len(cs)-1; i < j; i, j = i+1, j-1 {
-		cs[i], cs[j] = cs[j], cs[i]
-	}
-	return cs, nil
+	return parseCommitCSV(out)
 }
 
+// doltDiffSQL emits diff SQL between parent..child. If table=="" the diff
+// covers every changed table (CREATE TABLE included for first appearance).
 func doltDiffSQL(repo, parent, child, table string) (string, error) {
-	out, errs, err := run(repo, "", "dolt", "diff", "-r", "sql", parent, child, "--", table)
+	args := []string{"diff", "-r", "sql", parent, child}
+	if table != "" {
+		args = append(args, "--", table)
+	}
+	out, errs, err := run(repo, "", "dolt", args...)
 	if err != nil {
 		if strings.Contains(errs, "does not exist") {
 			return "", nil
 		}
 		return "", fmt.Errorf("dolt diff: %v\n%s", err, errs)
 	}
+	out = stripDoltDiffNoise(out)
+	out = rewriteColumnSwaps(out)
 	return out, nil
 }
 
+// stripDoltDiffNoise removes diagnostic lines that `dolt diff -r sql` emits
+// inline with SQL ("Incompatible schema change…", "Primary key sets differ…",
+// "warnings during diff…"). Without filtering these become syntax errors.
+func stripDoltDiffNoise(s string) string {
+	noisePrefixes := []string{
+		"Incompatible schema change",
+		"Primary key sets differ",
+		"warnings during diff",
+		"Warning: ",
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+nextLine:
+	for _, line := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(line)
+		for _, p := range noisePrefixes {
+			if strings.HasPrefix(t, p) {
+				continue nextLine
+			}
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+var reRenameCol = regexp.MustCompile("(?i)^ALTER TABLE [`\"]?(\\w+)[`\"]? RENAME COLUMN [`\"]?(\\w+)[`\"]? TO [`\"]?(\\w+)[`\"]?;\\s*$")
+
+// rewriteColumnSwaps detects the pattern
+//
+//	ALTER TABLE T RENAME COLUMN A TO B;
+//	ALTER TABLE T RENAME COLUMN B TO A;
+//
+// (which dolt happily emits but every SQL engine — including doltlite —
+// rejects because step 1 produces two columns named B) and rewrites it as a
+// three-step swap through a generated temporary name.
+func rewriteColumnSwaps(s string) string {
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	i := 0
+	for i < len(lines) {
+		m1 := reRenameCol.FindStringSubmatch(lines[i])
+		if m1 != nil && i+1 < len(lines) {
+			m2 := reRenameCol.FindStringSubmatch(lines[i+1])
+			if m2 != nil && m1[1] == m2[1] && m1[2] == m2[3] && m1[3] == m2[2] {
+				t, a, b := m1[1], m1[2], m1[3]
+				tmp := fmt.Sprintf("__swap_%s_%s", a, b)
+				out = append(out,
+					fmt.Sprintf("ALTER TABLE `%s` RENAME COLUMN `%s` TO `%s`;", t, a, tmp),
+					fmt.Sprintf("ALTER TABLE `%s` RENAME COLUMN `%s` TO `%s`;", t, b, a),
+					fmt.Sprintf("ALTER TABLE `%s` RENAME COLUMN `%s` TO `%s`;", t, tmp, b),
+				)
+				i += 2
+				continue
+			}
+		}
+		out = append(out, lines[i])
+		i++
+	}
+	return strings.Join(out, "\n")
+}
+
 func doltliteLog(db string, limit int) ([]Commit, error) {
-	sql := fmt.Sprintf("SELECT commit_hash, committer, email, date, message FROM dolt_log ORDER BY date DESC LIMIT %d", limit+1)
+	limitClause := ""
+	if limit > 0 {
+		limitClause = fmt.Sprintf(" LIMIT %d", limit+1)
+	}
+	// doltlite doesn't expose dolt_commit_ancestors yet — fetch in date order
+	// and chain parents in Go from the result rows. Root parent stays "".
+	sql := "SELECT commit_hash, committer, email, date, message FROM dolt_log " +
+		"ORDER BY date ASC" + limitClause
 	out, errs, err := run("", "", "doltlite", "-csv", "-header", db, sql)
 	if err != nil {
 		return nil, fmt.Errorf("doltlite log: %v\n%s", err, errs)
@@ -121,8 +210,11 @@ func doltliteLog(db string, limit int) ([]Commit, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i, j := 0, len(cs)-1; i < j; i, j = i+1, j-1 {
-		cs[i], cs[j] = cs[j], cs[i]
+	for i := range cs {
+		if i == 0 {
+			continue
+		}
+		cs[i].Parent = cs[i-1].Hash
 	}
 	return cs, nil
 }
@@ -216,7 +308,24 @@ var (
 	reCharset   = regexp.MustCompile(`(?i)\bCHARACTER SET\s+\w+`)
 	reCharsetD  = regexp.MustCompile(`(?i)\bDEFAULT CHARSET=\w+`)
 	reIntTypes  = regexp.MustCompile(`(?i)\b(tinyint|smallint|mediumint|int|bigint)(\(\d+\))?\b`)
+	reEnum      = regexp.MustCompile(`(?is)\benum\s*\([^)]*\)`)
+	reRenameTbl = regexp.MustCompile("(?i)\\bRENAME TABLE ([`\"]?\\w+[`\"]?) TO ([`\"]?\\w+[`\"]?)")
+
+	// MySQL-only ALTERs that SQLite/doltlite reject. We translate what we can
+	// and strip the rest with a comment so a future pass can audit them.
+	reAddIndex       = regexp.MustCompile("(?is)ALTER TABLE ([`\"]?\\w+[`\"]?) ADD (UNIQUE )?INDEX ([`\"]?\\w+[`\"]?)\\s*\\(([^)]+)\\);")
+	reAddFKConstr    = regexp.MustCompile("(?is)ALTER TABLE [`\"]?\\w+[`\"]? ADD CONSTRAINT [^;]*FOREIGN KEY[^;]*;")
+	reModifyColumn   = regexp.MustCompile("(?is)ALTER TABLE [`\"]?\\w+[`\"]? MODIFY COLUMN [^;]*;")
+	reDropPK         = regexp.MustCompile("(?is)ALTER TABLE [`\"]?\\w+[`\"]? DROP PRIMARY KEY;")
+	reAddPK          = regexp.MustCompile("(?is)ALTER TABLE [`\"]?\\w+[`\"]? ADD PRIMARY KEY[^;]*;")
+	reDropIndex      = regexp.MustCompile("(?is)ALTER TABLE ([`\"]?\\w+[`\"]?) DROP INDEX ([`\"]?\\w+[`\"]?);")
+	reAfterClause    = regexp.MustCompile(`(?i)\s+AFTER\s+\x60\w+\x60`)
+	reAutoIncrement  = regexp.MustCompile(`(?i)\s+AUTO_INCREMENT\b`)
+	reCreateTbl      = regexp.MustCompile("(?i)\\bCREATE TABLE ([`\"])")
+	reInsertInto     = regexp.MustCompile("(?i)\\bINSERT INTO ([`\"])")
+	reSet       = regexp.MustCompile(`(?is)\bset\s*\([^)]*\)`)
 	reVarchar   = regexp.MustCompile(`(?i)\bvarchar\s*\(\d+\)`)
+	reChar      = regexp.MustCompile(`(?i)\bchar\s*\(\d+\)`)
 	reLongtext  = regexp.MustCompile(`(?i)\b(longtext|mediumtext|tinytext)\b`)
 	reDatetime  = regexp.MustCompile(`(?i)\bdatetime\b`)
 	reTimestamp = regexp.MustCompile(`(?i)\btimestamp\b`)
@@ -228,11 +337,109 @@ func translateForSQLite(sql string) string {
 	sql = reCharset.ReplaceAllString(sql, "")
 	sql = reCharsetD.ReplaceAllString(sql, "")
 	sql = reIntTypes.ReplaceAllString(sql, "INTEGER")
+	sql = reEnum.ReplaceAllString(sql, "TEXT")
+	sql = reSet.ReplaceAllString(sql, "TEXT")
 	sql = reVarchar.ReplaceAllString(sql, "TEXT")
+	sql = reChar.ReplaceAllString(sql, "TEXT")
 	sql = reLongtext.ReplaceAllString(sql, "TEXT")
 	sql = reDatetime.ReplaceAllString(sql, "TEXT")
 	sql = reTimestamp.ReplaceAllString(sql, "TEXT")
-	return strings.ReplaceAll(sql, "`", `"`)
+	sql = reRenameTbl.ReplaceAllString(sql, "ALTER TABLE $1 RENAME TO $2")
+	// AFTER `col` is a MySQL ordering hint with no SQLite analogue; strip it.
+	sql = reAfterClause.ReplaceAllString(sql, "")
+	// ADD INDEX / ADD UNIQUE INDEX → CREATE [UNIQUE] INDEX
+	sql = reAddIndex.ReplaceAllStringFunc(sql, func(m string) string {
+		parts := reAddIndex.FindStringSubmatch(m)
+		uniq := strings.TrimSpace(parts[2])
+		if uniq != "" {
+			uniq = "UNIQUE "
+		}
+		return fmt.Sprintf("CREATE %sINDEX IF NOT EXISTS %s ON %s (%s);",
+			uniq, parts[3], parts[1], parts[4])
+	})
+	// SQLite can't add FK / change PK / modify column on an existing table
+	// without a full table rebuild. Skip with a SQL comment so the file is
+	// still valid — KNOWN_ISSUES.md tracks the schema-rebuild gap.
+	sql = reAddFKConstr.ReplaceAllString(sql, "-- skipped: ADD FOREIGN KEY (sqlite limitation)")
+	sql = reModifyColumn.ReplaceAllString(sql, "-- skipped: MODIFY COLUMN (sqlite limitation)")
+	sql = reDropPK.ReplaceAllString(sql, "-- skipped: DROP PRIMARY KEY (sqlite limitation)")
+	sql = reAddPK.ReplaceAllString(sql, "-- skipped: ADD PRIMARY KEY (sqlite limitation)")
+	sql = reDropIndex.ReplaceAllString(sql, "DROP INDEX IF EXISTS $2;")
+	sql = reAutoIncrement.ReplaceAllString(sql, "")
+	// Replay tolerance: dolt history may DROP+CREATE the same table later, or
+	// re-emit a row that's already present after we no-op'd a schema change.
+	// Make CREATE/INSERT idempotent so transient state mismatches don't halt
+	// the walk. Loses fidelity for true conflict-on-INSERT cases — acceptable
+	// for migration use where the final state is what matters.
+	sql = reCreateTbl.ReplaceAllString(sql, "CREATE TABLE IF NOT EXISTS $1")
+	sql = reInsertInto.ReplaceAllString(sql, "INSERT OR REPLACE INTO $1")
+	sql = strings.ReplaceAll(sql, "`", `"`)
+	return mysqlEscapesToSQLite(sql)
+}
+
+// mysqlEscapesToSQLite converts MySQL backslash escapes inside single-quoted
+// string literals (\\ \' \" \n \t \r \0 \b \Z) to SQLite's literal-or-doubled
+// form. Outside string literals the input is passed through unchanged.
+//
+// Dolt emits MySQL-flavoured INSERTs which use `\'` for an embedded quote;
+// SQLite treats backslash as literal and only recognizes `''` for the same
+// purpose, so without this translation any prayer text containing an apostrophe
+// (e.g. "Bahá'u'lláh") halts the .read at the first such row.
+func mysqlEscapesToSQLite(sql string) string {
+	var b strings.Builder
+	b.Grow(len(sql))
+	inStr := false
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+		if !inStr {
+			b.WriteByte(c)
+			if c == '\'' {
+				inStr = true
+			}
+			continue
+		}
+		// inside string
+		if c == '\\' && i+1 < len(sql) {
+			n := sql[i+1]
+			switch n {
+			case '\'':
+				b.WriteString("''")
+			case '"', '\\':
+				b.WriteByte(n)
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			case 'r':
+				b.WriteByte('\r')
+			case '0':
+				// SQLite tolerates NUL in TEXT but it's a footgun; drop.
+			case 'b':
+				b.WriteByte('\b')
+			case 'Z':
+				b.WriteByte(0x1A)
+			default:
+				// unknown escape: keep both bytes verbatim
+				b.WriteByte(c)
+				b.WriteByte(n)
+			}
+			i++
+			continue
+		}
+		if c == '\'' {
+			// MySQL also accepts '' as an embedded quote; SQLite uses the same.
+			if i+1 < len(sql) && sql[i+1] == '\'' {
+				b.WriteString("''")
+				i++
+				continue
+			}
+			b.WriteByte(c)
+			inStr = false
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
 }
 
 func translateForDolt(sql string) string {
@@ -293,7 +500,12 @@ func applyToDoltlite(db, sql, msg, author, email, date string) error {
 	}
 	commitSQL := fmt.Sprintf("SELECT dolt_commit('-A', '-m', '%s', '--author', '%s <%s>', '--date', '%s');",
 		strings.ReplaceAll(msg, "'", "''"), author, email, date)
-	if _, errs, err := run("", "", "doltlite", db, commitSQL); err != nil {
+	if out, errs, err := run("", "", "doltlite", db, commitSQL); err != nil {
+		// All of the diff translated away to "-- skipped" comments; no working
+		// set delta to commit. Treat as benign no-op so the walk can continue.
+		if strings.Contains(errs+out, "nothing to commit") {
+			return nil
+		}
 		return fmt.Errorf("doltlite commit: %v\n%s", err, errs)
 	}
 	return nil
@@ -328,15 +540,15 @@ func main() {
 		src     = flag.String("src", "", "Source path: dolt repo dir or doltlite db file")
 		dstKind = flag.String("dst-kind", "", "Target: dolt | doltlite")
 		dst     = flag.String("dst", "", "Target path")
-		table   = flag.String("table", "", "Table to replay (POC: one at a time)")
-		limit   = flag.Int("limit", 5, "Number of recent commits to walk (replays last N)")
+		table   = flag.String("table", "", "Table to replay (default: all tables in each commit)")
+		limit   = flag.Int("limit", 0, "Cap commits to walk in source order (0 = all, oldest→newest)")
 		dryRun  = flag.Bool("dry-run", false, "Print SQL, do not apply")
+		keepGo  = flag.Bool("continue-on-error", false, "Log apply failures and continue instead of aborting")
 	)
 	flag.Parse()
 	for _, p := range []struct{ name, val string }{
 		{"--src-kind", *srcKind}, {"--src", *src},
 		{"--dst-kind", *dstKind}, {"--dst", *dst},
-		{"--table", *table},
 	} {
 		if p.val == "" {
 			fmt.Fprintf(os.Stderr, "missing required flag %s\n", p.name)
@@ -358,19 +570,29 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "[%s] %d commits to walk\n", *srcKind, len(commits))
-	if len(commits) < 2 {
-		fmt.Fprintln(os.Stderr, "need at least 2 commits (a parent + a child)")
+	if len(commits) == 0 {
+		fmt.Fprintln(os.Stderr, "no commits found")
 		os.Exit(1)
 	}
 
-	parent := commits[0].Hash
 	replayed := 0
-	for _, c := range commits[1:] {
+	skipped := 0
+	failed := 0
+	for _, c := range commits {
+		if c.Parent == "" {
+			fmt.Fprintf(os.Stderr, "(skip root commit %s — no parent diff)\n", short10(c.Hash))
+			skipped++
+			continue
+		}
 		var sql string
 		if *srcKind == "dolt" {
-			sql, err = doltDiffSQL(*src, parent, c.Hash, *table)
+			sql, err = doltDiffSQL(*src, c.Parent, c.Hash, *table)
 		} else {
-			sql, err = doltliteDiffSQL(*src, parent, c.Hash, *table)
+			if *table == "" {
+				fmt.Fprintln(os.Stderr, "doltlite source requires --table (whole-commit diff not implemented for doltlite)")
+				os.Exit(2)
+			}
+			sql, err = doltliteDiffSQL(*src, c.Parent, c.Hash, *table)
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -383,10 +605,7 @@ func main() {
 			sql = translateForDolt(sql)
 		}
 
-		short := c.Hash
-		if len(short) > 10 {
-			short = short[:10]
-		}
+		short := short10(c.Hash)
 		msg := strings.SplitN(c.Message, "\n", 2)[0]
 		if len(msg) > 60 {
 			msg = msg[:60]
@@ -395,8 +614,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "    SQL: %d bytes\n", len(sql))
 
 		if strings.TrimSpace(sql) == "" {
-			fmt.Fprintln(os.Stderr, "    (no changes to this table — skip)")
-			parent = c.Hash
+			fmt.Fprintln(os.Stderr, "    (no changes — skip)")
+			skipped++
 			continue
 		}
 
@@ -409,12 +628,26 @@ func main() {
 				err = applyToDoltlite(*dst, sql, c.Message, c.Author, c.Email, c.Date)
 			}
 			if err != nil {
+				if *keepGo {
+					fmt.Fprintf(os.Stderr, "    FAIL: %v\n", err)
+					failed++
+					continue
+				}
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
 			replayed++
 		}
-		parent = c.Hash
 	}
-	fmt.Fprintf(os.Stderr, "\n[done] replayed %d commits\n", replayed)
+	fmt.Fprintf(os.Stderr, "\n[done] replayed %d commits, skipped %d, failed %d\n", replayed, skipped, failed)
+	if failed > 0 {
+		os.Exit(1)
+	}
+}
+
+func short10(s string) string {
+	if len(s) > 10 {
+		return s[:10]
+	}
+	return s
 }

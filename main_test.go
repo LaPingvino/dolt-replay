@@ -64,7 +64,7 @@ func TestTranslateForSQLite(t *testing.T) {
 		{
 			"strip ENGINE/CHARSET/COLLATE on CREATE TABLE",
 			"CREATE TABLE `t` (`x` int) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
-			[]string{"CREATE TABLE \"t\"", "\"x\" INTEGER", ");"},
+			[]string{"CREATE TABLE IF NOT EXISTS \"t\"", "\"x\" INTEGER", ");"},
 			[]string{"ENGINE", "CHARSET", "COLLATE", "InnoDB", "`"},
 		},
 		{
