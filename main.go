@@ -921,9 +921,15 @@ func rebuildTableFromDolt(db, repo, commit, table string) error {
 		return fmt.Errorf("no overlapping columns between old %v and new %v", oldCols, newCols)
 	}
 	colList := strings.Join(quoteAll(common, "\""), ",")
+	// INSERT OR IGNORE because the new schema may add NOT NULL constraints
+	// (e.g. the bahaiwritings PK migration ALTERs `version` to NOT NULL +
+	// declares it the new PK); rows in the old table that violate the new
+	// constraint would otherwise abort the whole migration and leave the
+	// table in a half-rebuilt state. Dropping those rows is the correct
+	// behavior — they couldn't survive the migration in source either.
 	migration := fmt.Sprintf(`BEGIN;
 %s
-INSERT INTO "%s" (%s) SELECT %s FROM "%s";
+INSERT OR IGNORE INTO "%s" (%s) SELECT %s FROM "%s";
 DROP TABLE "%s";
 ALTER TABLE "%s" RENAME TO "%s";
 COMMIT;`, createSQL, rebuildName, colList, colList, table, table, rebuildName, table)
