@@ -638,6 +638,30 @@ type repairCtx struct {
 	rebuild                    bool
 }
 
+// dlSession is the optional persistent doltlite REPL subprocess used when
+// --persistent-doltlite is set. nil = one-shot mode.
+var dlSession *doltliteSession
+
+// applyChunk runs a chunk SQL file against the destination database and
+// returns (stdout, stderr, error). Uses dlSession if available, otherwise
+// shells out one-shot. On session error the session is closed so the next
+// chunk gets a fresh one — and the existing one-shot retry still works as a
+// safety net because the caller's repair loop falls back to one-shot via
+// runOneShotChunk after this returns an error.
+func applyChunk(db, scriptPath string) (string, string, error) {
+	if dlSession != nil {
+		out, errs, err := dlSession.Apply(scriptPath, 60*time.Second)
+		if err != nil {
+			dlSession.closeQuietly()
+			dlSession = nil
+		} else if looksLikeDoltliteError(errs) {
+			err = fmt.Errorf("doltlite reported error")
+		}
+		return out, errs, err
+	}
+	return run("", "", "doltlite", "-bail", db, "-cmd", ".read "+scriptPath)
+}
+
 var (
 	reNoSuchTable = regexp.MustCompile(`(?i)no such table:\s*"?(\w+)"?`)
 	// SQLite refuses ALTER TABLE … DROP COLUMN when the column is part of the
@@ -678,7 +702,7 @@ func applyToDoltlite(db, sql, msg, author, email, date string, rc repairCtx) err
 			io.WriteString(f, "COMMIT;\n")
 			f.Close()
 			t0 := time.Now()
-			out, errs, err := run("", "", "doltlite", "-bail", db, "-cmd", ".read "+f.Name())
+			out, errs, err := applyChunk(db, f.Name())
 			dt := time.Since(t0)
 			os.Remove(f.Name())
 			if dt > 500*time.Millisecond {
@@ -734,7 +758,29 @@ func applyToDoltlite(db, sql, msg, author, email, date string, rc repairCtx) err
 	commitSQL := fmt.Sprintf("SELECT dolt_commit('-A', '-m', '%s', '--author', '%s <%s>', '--date', '%s');",
 		strings.ReplaceAll(msg, "'", "''"), author, email, date)
 	tc0 := time.Now()
-	out, errs, err := run("", "", "doltlite", db, commitSQL)
+	var (
+		out, errs string
+		err       error
+	)
+	if dlSession != nil {
+		// Persistent path: write the SELECT to a tempfile and route through the
+		// same session so the dolt_commit observes the WAL state from the chunk
+		// applies above. Mixing one-shot runs with a live session causes the
+		// one-shot to see a stale snapshot and silently commit nothing.
+		f, ferr := os.CreateTemp("", "replay-commit-*.sql")
+		if ferr != nil {
+			return ferr
+		}
+		io.WriteString(f, commitSQL+"\n")
+		f.Close()
+		out, errs, err = dlSession.Apply(f.Name(), 60*time.Second)
+		os.Remove(f.Name())
+		if err == nil && looksLikeDoltliteError(errs) {
+			err = fmt.Errorf("doltlite reported error during dolt_commit")
+		}
+	} else {
+		out, errs, err = run("", "", "doltlite", db, commitSQL)
+	}
 	dtc := time.Since(tc0)
 	if dtc > 500*time.Millisecond {
 		fmt.Fprintf(os.Stderr, "      dolt_commit %.2fs\n", dtc.Seconds())
@@ -1014,7 +1060,8 @@ func main() {
 		limit   = flag.Int("limit", 0, "Cap commits to walk in source order (0 = all, oldest→newest)")
 		dryRun  = flag.Bool("dry-run", false, "Print SQL, do not apply")
 		keepGo  = flag.Bool("continue-on-error", false, "Log apply failures and continue instead of aborting")
-		rebuild = flag.Bool("rebuild-on-pk-drop", true, "Emulate ALTER DROP PK-column via full table rebuild (recommended; pass --rebuild-on-pk-drop=false to disable)")
+		rebuild     = flag.Bool("rebuild-on-pk-drop", true, "Emulate ALTER DROP PK-column via full table rebuild (recommended; pass --rebuild-on-pk-drop=false to disable)")
+		persistent  = flag.Bool("persistent-doltlite", true, "Reuse a single doltlite REPL subprocess across chunks (saves ~50ms cold-start per chunk; pass =false to revert to one-shot per chunk)")
 	)
 	flag.Parse()
 	for _, p := range []struct{ name, val string }{
@@ -1044,6 +1091,20 @@ func main() {
 	if len(commits) == 0 {
 		fmt.Fprintln(os.Stderr, "no commits found")
 		os.Exit(1)
+	}
+
+	if *persistent && *dstKind == "doltlite" && !*dryRun {
+		s, err := newDoltliteSession("doltlite", *dst)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: persistent doltlite session failed to start (%v) — falling back to one-shot\n", err)
+		} else {
+			dlSession = s
+			defer func() {
+				if dlSession != nil {
+					dlSession.Close()
+				}
+			}()
+		}
 	}
 
 	replayed := 0
