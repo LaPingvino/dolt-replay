@@ -651,6 +651,12 @@ var (
 
 func applyToDoltlite(db, sql, msg, author, email, date string, rc repairCtx) error {
 	stmts := splitStatements(sql)
+	preCoalesce := len(stmts)
+	stmts = coalesceInserts(stmts, 200)
+	if preCoalesce != len(stmts) {
+		fmt.Fprintf(os.Stderr, "    [coalesced %d INSERTs → %d statements]\n",
+			preCoalesce, len(stmts))
+	}
 	fmt.Fprintf(os.Stderr, "    [%d statements → %d chunks of <=%d, BEGIN/COMMIT wrapped]\n",
 		len(stmts), (len(stmts)+chunkSize-1)/chunkSize, chunkSize)
 	for i := 0; i < len(stmts); i += chunkSize {
@@ -924,6 +930,68 @@ func splitStatements(sql string) []string {
 			out = append(out, t)
 		}
 	}
+	return out
+}
+
+// reInsertHead matches `INSERT INTO <tbl> [(<cols>)] VALUES` and captures the
+// table identifier (with backticks/quotes preserved) and the optional column
+// list. Anything after VALUES is the per-row tuple, captured by the trailing
+// group on the original statement.
+var reInsertHead = regexp.MustCompile(`(?is)^\s*INSERT\s+INTO\s+(` + "`[^`]+`" + `|"[^"]+"|\w+)\s*(\([^)]*\))?\s*VALUES\s*(.+)$`)
+
+// coalesceInserts merges runs of consecutive INSERT statements that target the
+// same table and column list into one multi-row INSERT, up to maxRows tuples
+// per merged statement. This collapses N implicit-savepoint flushes into 1 in
+// doltlite (the dominant cost for bulk-INSERT phases).
+//
+// Non-INSERT statements and inserts whose head doesn't parse pass through
+// unchanged, preserving statement order.
+func coalesceInserts(stmts []string, maxRows int) []string {
+	if maxRows < 2 {
+		return stmts
+	}
+	out := make([]string, 0, len(stmts))
+	// runKey identifies a coalescable group: table + column list (verbatim).
+	var (
+		runKey    string
+		runHead   string   // "INSERT INTO `t` (`a`,`b`) VALUES "
+		runValues []string // each entry is the tuple text, e.g. "(1, 'x')"
+	)
+	flush := func() {
+		if len(runValues) == 0 {
+			return
+		}
+		if len(runValues) == 1 {
+			out = append(out, runHead+runValues[0])
+		} else {
+			out = append(out, runHead+strings.Join(runValues, ", "))
+		}
+		runKey, runHead, runValues = "", "", nil
+	}
+	for _, s := range stmts {
+		m := reInsertHead.FindStringSubmatch(s)
+		if m == nil {
+			flush()
+			out = append(out, s)
+			continue
+		}
+		tbl, cols, tuple := m[1], m[2], strings.TrimSpace(m[3])
+		// strip a single trailing semicolon (splitStatements may keep one if the
+		// final statement isn't followed by ";\n"), so multi-row joining stays clean
+		tuple = strings.TrimRight(tuple, ";")
+		key := tbl + "\x00" + cols
+		if key != runKey || len(runValues) >= maxRows {
+			flush()
+			runKey = key
+			head := "INSERT INTO " + tbl + " "
+			if cols != "" {
+				head += cols + " "
+			}
+			runHead = head + "VALUES "
+		}
+		runValues = append(runValues, tuple)
+	}
+	flush()
 	return out
 }
 

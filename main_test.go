@@ -54,6 +54,110 @@ func TestSplitStatements(t *testing.T) {
 	}
 }
 
+func TestCoalesceInserts(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      []string
+		maxRows int
+		want    []string
+	}{
+		{
+			"two inserts same shape merge",
+			[]string{
+				"INSERT INTO `t` (`a`,`b`) VALUES (1, 'x')",
+				"INSERT INTO `t` (`a`,`b`) VALUES (2, 'y')",
+			},
+			10,
+			[]string{"INSERT INTO `t` (`a`,`b`) VALUES (1, 'x'), (2, 'y')"},
+		},
+		{
+			"different tables don't merge",
+			[]string{
+				"INSERT INTO `a` VALUES (1)",
+				"INSERT INTO `b` VALUES (2)",
+			},
+			10,
+			[]string{"INSERT INTO `a` VALUES (1)", "INSERT INTO `b` VALUES (2)"},
+		},
+		{
+			"different column lists don't merge",
+			[]string{
+				"INSERT INTO `t` (`a`) VALUES (1)",
+				"INSERT INTO `t` (`a`,`b`) VALUES (2, 3)",
+			},
+			10,
+			[]string{
+				"INSERT INTO `t` (`a`) VALUES (1)",
+				"INSERT INTO `t` (`a`,`b`) VALUES (2, 3)",
+			},
+		},
+		{
+			"non-insert in the middle breaks the run",
+			[]string{
+				"INSERT INTO `t` VALUES (1)",
+				"INSERT INTO `t` VALUES (2)",
+				"UPDATE `t` SET `x`='y' WHERE `id`=3",
+				"INSERT INTO `t` VALUES (4)",
+				"INSERT INTO `t` VALUES (5)",
+			},
+			10,
+			[]string{
+				"INSERT INTO `t` VALUES (1), (2)",
+				"UPDATE `t` SET `x`='y' WHERE `id`=3",
+				"INSERT INTO `t` VALUES (4), (5)",
+			},
+		},
+		{
+			"maxRows caps merged group",
+			[]string{
+				"INSERT INTO `t` VALUES (1)",
+				"INSERT INTO `t` VALUES (2)",
+				"INSERT INTO `t` VALUES (3)",
+			},
+			2,
+			[]string{
+				"INSERT INTO `t` VALUES (1), (2)",
+				"INSERT INTO `t` VALUES (3)",
+			},
+		},
+		{
+			"maxRows<2 disables coalescing",
+			[]string{
+				"INSERT INTO `t` VALUES (1)",
+				"INSERT INTO `t` VALUES (2)",
+			},
+			1,
+			[]string{
+				"INSERT INTO `t` VALUES (1)",
+				"INSERT INTO `t` VALUES (2)",
+			},
+		},
+		{
+			"single insert passes through",
+			[]string{"INSERT INTO `t` VALUES (1)"},
+			10,
+			[]string{"INSERT INTO `t` VALUES (1)"},
+		},
+		{
+			"trailing semicolon stripped before merge",
+			[]string{
+				"INSERT INTO `t` VALUES (1);",
+				"INSERT INTO `t` VALUES (2);",
+			},
+			10,
+			[]string{"INSERT INTO `t` VALUES (1), (2)"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := coalesceInserts(tc.in, tc.maxRows)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %#v\nwant %#v", got, tc.want)
+			}
+		})
+	}
+}
+
 // ---------- translateForSQLite ----------
 
 func TestTranslateForSQLite(t *testing.T) {
