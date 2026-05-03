@@ -753,6 +753,16 @@ func TestE2E_DropPKColumnSchemaMigration(t *testing.T) {
 	if got != 8 {
 		t.Fatalf("target: got %d, want 8 (duplicate rows = PK migration not handled)", got)
 	}
+	// Schema check: the new PK (version) must be declared. Without it, future
+	// reapplied chunks would silently insert duplicates (INSERT OR REPLACE
+	// degrades to plain INSERT when there's no PK to trigger the conflict).
+	schema, err := exec.Command("doltlite", dst, ".schema w").CombinedOutput()
+	if err != nil {
+		t.Fatalf(".schema w: %v\n%s", err, schema)
+	}
+	if !strings.Contains(string(schema), `PRIMARY KEY ("version")`) {
+		t.Fatalf("schema missing PRIMARY KEY (version):\n%s", schema)
+	}
 }
 
 // TestE2E_MultilineStringLiteral exercises the `splitStatements` bug we

@@ -319,6 +319,8 @@ var (
 	reModifyColumn   = regexp.MustCompile("(?is)ALTER TABLE [`\"]?\\w+[`\"]? MODIFY COLUMN [^;]*;")
 	reDropPK         = regexp.MustCompile("(?is)ALTER TABLE [`\"]?\\w+[`\"]? DROP PRIMARY KEY;")
 	reAddPK          = regexp.MustCompile("(?is)ALTER TABLE [`\"]?\\w+[`\"]? ADD PRIMARY KEY[^;]*;")
+	reAddPKTbl       = regexp.MustCompile("(?is)ALTER TABLE [`\"]?(\\w+)[`\"]? ADD PRIMARY KEY")
+	rePKRebuildMark  = regexp.MustCompile(`-- DOLT_REPLAY_PK_REBUILD_NEEDED:(\w+)`)
 	reDropIndex      = regexp.MustCompile("(?is)ALTER TABLE ([`\"]?\\w+[`\"]?) DROP INDEX ([`\"]?\\w+[`\"]?);")
 	reAfterClause    = regexp.MustCompile(`(?i)\s+AFTER\s+\x60\w+\x60`)
 	reAutoIncrement  = regexp.MustCompile(`(?i)\s+AUTO_INCREMENT\b`)
@@ -370,7 +372,17 @@ func translateForSQLite(sql string) string {
 	sql = reAddFKConstr.ReplaceAllString(sql, "-- skipped: ADD FOREIGN KEY (sqlite limitation)")
 	sql = reModifyColumn.ReplaceAllString(sql, "-- skipped: MODIFY COLUMN (sqlite limitation)")
 	sql = reDropPK.ReplaceAllString(sql, "-- skipped: DROP PRIMARY KEY (sqlite limitation)")
-	sql = reAddPK.ReplaceAllString(sql, "-- skipped: ADD PRIMARY KEY (sqlite limitation)")
+	// ADD PRIMARY KEY can't be applied directly in SQLite, but we CAN realize
+	// the new PK via a full table rebuild against the source's post-commit
+	// schema. Embed the table name in a sentinel marker so applyToDoltlite can
+	// pick the table list out and trigger rebuildTableFromDolt before the chunk.
+	sql = reAddPK.ReplaceAllStringFunc(sql, func(m string) string {
+		sub := reAddPKTbl.FindStringSubmatch(m)
+		if sub == nil {
+			return "-- skipped: ADD PRIMARY KEY (sqlite limitation, table-name parse failed)"
+		}
+		return fmt.Sprintf("-- DOLT_REPLAY_PK_REBUILD_NEEDED:%s", sub[1])
+	})
 	sql = reDropIndex.ReplaceAllString(sql, "DROP INDEX IF EXISTS $2;")
 	sql = reAutoIncrement.ReplaceAllString(sql, "")
 	sql = reAutoIncOption.ReplaceAllString(sql, "")
@@ -679,6 +691,47 @@ var (
 )
 
 func applyToDoltlite(db, sql, msg, author, email, date string, rc repairCtx) error {
+	// Proactive PK-rebuild: if translateForSQLite recognized an
+	// `ALTER TABLE … ADD PRIMARY KEY` and stamped a sentinel marker, pull the
+	// new schema (with its declared PK) from source via SHOW CREATE TABLE
+	// AS OF '<commit>' and rebuild the target table now. Without this, the
+	// table loses its PK and INSERT OR REPLACE silently degrades to plain
+	// INSERT, accumulating duplicates on every reapplied chunk.
+	//
+	// After a successful rebuild the table is already at the post-commit
+	// schema, so any other `ALTER TABLE <T> …` statements in this commit's
+	// chunk (DROP COLUMN, etc.) become redundant and would error against the
+	// new structure. Strip them.
+	if rc.rebuild && rc.srcKind == "dolt" && rc.src != "" && rc.sourceCommit != "" {
+		seen := map[string]bool{}
+		marks := rePKRebuildMark.FindAllStringSubmatch(sql, -1)
+		// Any one-shot doltlite invocation against the same DB while the
+		// persistent session is open will trip a "commit conflict: another
+		// connection committed to this branch" error and leave the session's
+		// view stale. Close the session before any external mutation; it will
+		// be lazily replaced by one-shot in applyChunk.
+		if len(marks) > 0 && dlSession != nil {
+			dlSession.closeQuietly()
+			dlSession = nil
+		}
+		for _, m := range marks {
+			if seen[m[1]] {
+				continue
+			}
+			seen[m[1]] = true
+			fmt.Fprintf(os.Stderr, "    [PK rebuild] %s — fetching schema from source @ %s\n",
+				m[1], short10(rc.sourceCommit))
+			if err := rebuildTableFromDolt(db, rc.src, rc.sourceCommit, m[1]); err != nil {
+				return fmt.Errorf("PK rebuild for %q failed: %v", m[1], err)
+			}
+		}
+		for tbl := range seen {
+			// Strip any other ALTER TABLE <tbl> statement (DROP COLUMN etc.).
+			pat := regexp.MustCompile(fmt.Sprintf(`(?is)ALTER TABLE\s+["` + "`" + `]?%s["` + "`" + `]?[^;]*;`, regexp.QuoteMeta(tbl)))
+			sql = pat.ReplaceAllString(sql, "-- skipped: ALTER on "+tbl+" (already applied via PK rebuild)")
+		}
+	}
+
 	stmts := splitStatements(sql)
 	preInsert := len(stmts)
 	stmts = coalesceInserts(stmts, 200)
