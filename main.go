@@ -970,16 +970,55 @@ func quoteAll(ss []string, q string) []string {
 	return out
 }
 
-// splitStatements naively splits on `;` followed by newline. Good enough for
-// dolt-diff output (one statement per line) but not for embedded `;\n` inside
-// quoted strings (rare in practice for our schema/data).
+// splitStatements splits a SQL stream on `;` followed by newline, ignoring
+// any such sequence that falls inside a single-quoted string literal. The
+// embedded-`;\n`-inside-string case is real for dolt-diff output of multi-
+// line text columns (e.g. the `Tablet of the Holy Mariner` row in the
+// bahaiwritings writings table), where translateForSQLite has converted the
+// MySQL `\n` escape into an actual newline before this point — so a string
+// literal can legitimately contain `;\n` and must stay one statement.
+//
+// Single quotes inside strings are escaped by doubling (`''`); this scanner
+// therefore treats a `''` pair while inside a string as a literal quote, not
+// a string close.
 func splitStatements(sql string) []string {
-	parts := strings.Split(sql, ";\n")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			out = append(out, t)
+	out := make([]string, 0, 32)
+	var cur strings.Builder
+	inStr := false
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+		if inStr {
+			if c == '\'' {
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					cur.WriteByte('\'')
+					cur.WriteByte('\'')
+					i++
+					continue
+				}
+				inStr = false
+				cur.WriteByte(c)
+				continue
+			}
+			cur.WriteByte(c)
+			continue
 		}
+		if c == '\'' {
+			inStr = true
+			cur.WriteByte(c)
+			continue
+		}
+		if c == ';' && i+1 < len(sql) && sql[i+1] == '\n' {
+			if t := strings.TrimSpace(cur.String()); t != "" {
+				out = append(out, t)
+			}
+			cur.Reset()
+			i++ // consume the '\n'
+			continue
+		}
+		cur.WriteByte(c)
+	}
+	if t := strings.TrimSpace(cur.String()); t != "" {
+		out = append(out, t)
 	}
 	return out
 }

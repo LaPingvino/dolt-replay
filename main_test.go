@@ -39,6 +39,22 @@ func TestSplitStatements(t *testing.T) {
 			"CREATE TABLE t (a INT);\n",
 			[]string{"CREATE TABLE t (a INT)"},
 		},
+		{
+			"actual newline + semicolon inside single-quoted string stays in one statement",
+			"INSERT INTO t VALUES (1, '## Tablet\nLine2 ; here\nLine3');\nINSERT INTO t VALUES (2, 'b');\n",
+			[]string{
+				"INSERT INTO t VALUES (1, '## Tablet\nLine2 ; here\nLine3')",
+				"INSERT INTO t VALUES (2, 'b')",
+			},
+		},
+		{
+			"escaped single quote (doubled) inside string is a literal, not a close",
+			"INSERT INTO t VALUES ('it''s here;\nstill in string');\nINSERT INTO t VALUES ('next');\n",
+			[]string{
+				"INSERT INTO t VALUES ('it''s here;\nstill in string')",
+				"INSERT INTO t VALUES ('next')",
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
