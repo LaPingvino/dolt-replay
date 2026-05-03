@@ -147,6 +147,27 @@ func TestCoalesceInserts(t *testing.T) {
 			10,
 			[]string{"INSERT INTO `t` VALUES (1), (2)"},
 		},
+		{
+			"INSERT OR REPLACE merges with same shape",
+			[]string{
+				"INSERT OR REPLACE INTO \"writings\" (\"id\",\"body\") VALUES (1,'a')",
+				"INSERT OR REPLACE INTO \"writings\" (\"id\",\"body\") VALUES (2,'b')",
+			},
+			10,
+			[]string{`INSERT OR REPLACE INTO "writings" ("id","body") VALUES (1,'a'), (2,'b')`},
+		},
+		{
+			"INSERT OR REPLACE and plain INSERT do not merge across verbs",
+			[]string{
+				"INSERT OR REPLACE INTO `t` VALUES (1)",
+				"INSERT INTO `t` VALUES (2)",
+			},
+			10,
+			[]string{
+				"INSERT OR REPLACE INTO `t` VALUES (1)",
+				"INSERT INTO `t` VALUES (2)",
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

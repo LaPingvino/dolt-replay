@@ -651,13 +651,18 @@ var dlSession *doltliteSession
 func applyChunk(db, scriptPath string) (string, string, error) {
 	if dlSession != nil {
 		out, errs, err := dlSession.Apply(scriptPath, 60*time.Second)
-		if err != nil {
-			dlSession.closeQuietly()
-			dlSession = nil
-		} else if looksLikeDoltliteError(errs) {
-			err = fmt.Errorf("doltlite reported error")
+		if err == nil && !looksLikeDoltliteError(errs) {
+			return out, errs, nil
 		}
-		return out, errs, err
+		// Session-side failure: tear down the session, retry this chunk via the
+		// one-shot path before bubbling the error up. Without this retry, a
+		// transient session hiccup (or any statement the REPL handles
+		// differently than `-cmd`, e.g. some ALTER MODIFY COLUMN forms) would
+		// silently drop the chunk under --continue-on-error.
+		fmt.Fprintf(os.Stderr, "    [persistent session error — retrying chunk one-shot]\n")
+		dlSession.closeQuietly()
+		dlSession = nil
+		return run("", "", "doltlite", "-bail", db, "-cmd", ".read "+scriptPath)
 	}
 	return run("", "", "doltlite", "-bail", db, "-cmd", ".read "+scriptPath)
 }
@@ -979,11 +984,13 @@ func splitStatements(sql string) []string {
 	return out
 }
 
-// reInsertHead matches `INSERT INTO <tbl> [(<cols>)] VALUES` and captures the
-// table identifier (with backticks/quotes preserved) and the optional column
-// list. Anything after VALUES is the per-row tuple, captured by the trailing
-// group on the original statement.
-var reInsertHead = regexp.MustCompile(`(?is)^\s*INSERT\s+INTO\s+(` + "`[^`]+`" + `|"[^"]+"|\w+)\s*(\([^)]*\))?\s*VALUES\s*(.+)$`)
+// reInsertHead matches `INSERT [OR REPLACE|IGNORE|...] INTO <tbl> [(<cols>)] VALUES`
+// and captures the verb prefix, table identifier (backticks/quotes preserved), and
+// optional column list. Anything after VALUES is the per-row tuple, captured by the
+// trailing group on the original statement. The verb prefix is preserved verbatim
+// when reassembling the merged head, so `INSERT OR REPLACE` (translateForSQLite's
+// dolt-MySQL translation) coalesces correctly alongside plain `INSERT`.
+var reInsertHead = regexp.MustCompile(`(?is)^\s*(INSERT(?:\s+OR\s+\w+)?)\s+INTO\s+(` + "`[^`]+`" + `|"[^"]+"|\w+)\s*(\([^)]*\))?\s*VALUES\s*(.+)$`)
 
 // coalesceInserts merges runs of consecutive INSERT statements that target the
 // same table and column list into one multi-row INSERT, up to maxRows tuples
@@ -1021,15 +1028,19 @@ func coalesceInserts(stmts []string, maxRows int) []string {
 			out = append(out, s)
 			continue
 		}
-		tbl, cols, tuple := m[1], m[2], strings.TrimSpace(m[3])
+		// groups: 1=verb (INSERT or INSERT OR REPLACE), 2=table, 3=optional cols, 4=tuple
+		verb, tbl, cols, tuple := m[1], m[2], m[3], strings.TrimSpace(m[4])
+		// normalize the verb's inner whitespace so distinct spellings of the same
+		// verb (e.g. "INSERT  OR  REPLACE") share a coalesce key
+		verb = strings.Join(strings.Fields(verb), " ")
 		// strip a single trailing semicolon (splitStatements may keep one if the
 		// final statement isn't followed by ";\n"), so multi-row joining stays clean
 		tuple = strings.TrimRight(tuple, ";")
-		key := tbl + "\x00" + cols
+		key := verb + "\x00" + tbl + "\x00" + cols
 		if key != runKey || len(runValues) >= maxRows {
 			flush()
 			runKey = key
-			head := "INSERT INTO " + tbl + " "
+			head := verb + " INTO " + tbl + " "
 			if cols != "" {
 				head += cols + " "
 			}
