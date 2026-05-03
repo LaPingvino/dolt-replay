@@ -283,6 +283,32 @@ func TestCoalesceUpdates(t *testing.T) {
 				"UPDATE `t` SET `a`='y' WHERE `pk`=2",
 			},
 		},
+		{
+			// Hit live in the bahaiwritings re-clone: the lazy `(.+?)` value
+			// capture would grab "'X', \"name\"='Y'" as one value and splice
+			// commas mid-CASE-WHEN — yielding "WHEN k THEN 'X', \"name\"='Y'".
+			"multi-column SET passes through unchanged (no false coalesce)",
+			[]string{
+				"UPDATE `writings` SET `phelps`='BH11205',\"name\"='Blessed' WHERE `version`='uuid-1'",
+				"UPDATE `writings` SET `phelps`='BH11206' WHERE `version`='uuid-2'",
+			},
+			10,
+			[]string{
+				"UPDATE `writings` SET `phelps`='BH11205',\"name\"='Blessed' WHERE `version`='uuid-1'",
+				"UPDATE `writings` SET `phelps`='BH11206' WHERE `version`='uuid-2'",
+			},
+		},
+		{
+			"value containing a comma INSIDE a string still coalesces",
+			[]string{
+				"UPDATE `t` SET `name`='Hello, world' WHERE `pk`=1",
+				"UPDATE `t` SET `name`='Foo, bar' WHERE `pk`=2",
+			},
+			10,
+			[]string{
+				"UPDATE `t` SET `name` = CASE `pk` WHEN 1 THEN 'Hello, world' WHEN 2 THEN 'Foo, bar' ELSE `name` END WHERE `pk` IN (1, 2)",
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

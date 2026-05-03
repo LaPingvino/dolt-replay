@@ -1142,6 +1142,15 @@ func coalesceUpdates(stmts []string, maxRows int) []string {
 		tbl, setCol, val, whereCol, key := m[1], m[2], m[3], m[4], m[5]
 		key = strings.TrimRight(strings.TrimSpace(key), ";")
 		val = strings.TrimSpace(val)
+		// Reject multi-column SETs (`SET a=1, b=2 WHERE ...`): the lazy regex
+		// would have grabbed `1, b=2` as the "value" — splicing that into a
+		// CASE WHEN ... THEN <val> branch breaks the SQL. Any top-level
+		// (unquoted) comma in val is the giveaway.
+		if hasTopLevelComma(val) || hasTopLevelComma(key) {
+			flush()
+			out = append(out, s)
+			continue
+		}
 		groupKey := tbl + "\x00" + setCol + "\x00" + whereCol
 		if groupKey != runKey || len(runWhens) >= maxRows {
 			flush()
@@ -1154,6 +1163,34 @@ func coalesceUpdates(stmts []string, maxRows int) []string {
 	}
 	flush()
 	return out
+}
+
+// hasTopLevelComma reports whether s contains a `,` outside of any
+// single-quoted string literal. SQL escapes a literal quote inside a string
+// by doubling (`''`), which we treat as content.
+func hasTopLevelComma(s string) bool {
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inStr = false
+			}
+			continue
+		}
+		if c == '\'' {
+			inStr = true
+			continue
+		}
+		if c == ',' {
+			return true
+		}
+	}
+	return false
 }
 
 // reInsertHead matches `INSERT [OR REPLACE|IGNORE|...] INTO <tbl> [(<cols>)] VALUES`
