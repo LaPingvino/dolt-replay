@@ -149,3 +149,59 @@ func BenchmarkDoltliteTextPKInsertMultiRow(b *testing.B) {
 	b.StopTimer()
 	benchInsertShape(b, true)
 }
+
+// Compares N per-row UPDATE-by-PK statements vs a single CASE-batched UPDATE
+// touching the same N rows, both inside one BEGIN/COMMIT. Validates whether
+// coalesceUpdates can collapse the bulk-remap chunks.
+func benchUpdateShape(b *testing.B, batched bool) {
+	dlite, rows := benchSetup(b)
+	for i := 0; i < b.N; i++ {
+		dir := b.TempDir()
+		db := filepath.Join(dir, "bench.dl")
+
+		var seed strings.Builder
+		seed.WriteString("CREATE TABLE t (pk TEXT PRIMARY KEY, payload TEXT);\nBEGIN;\n")
+		for k := 1; k <= rows; k++ {
+			fmt.Fprintf(&seed, "INSERT INTO t VALUES ('uuid-%08x-aaaa-bbbb-cccc-000000000000', 'old-%d');\n", k, k)
+		}
+		seed.WriteString("COMMIT;\n")
+		runScript(b, dlite, db, seed.String())
+
+		var upd strings.Builder
+		upd.WriteString("BEGIN;\n")
+		if batched {
+			upd.WriteString("UPDATE t SET payload = CASE pk ")
+			for k := 1; k <= rows; k++ {
+				fmt.Fprintf(&upd, "WHEN 'uuid-%08x-aaaa-bbbb-cccc-000000000000' THEN 'new-%d' ", k, k)
+			}
+			upd.WriteString("ELSE payload END WHERE pk IN (")
+			for k := 1; k <= rows; k++ {
+				if k > 1 {
+					upd.WriteString(",")
+				}
+				fmt.Fprintf(&upd, "'uuid-%08x-aaaa-bbbb-cccc-000000000000'", k)
+			}
+			upd.WriteString(");\n")
+		} else {
+			for k := 1; k <= rows; k++ {
+				fmt.Fprintf(&upd, "UPDATE t SET payload='new-%d' WHERE pk='uuid-%08x-aaaa-bbbb-cccc-000000000000';\n", k, k)
+			}
+		}
+		upd.WriteString("COMMIT;\n")
+
+		b.StartTimer()
+		d := runScript(b, dlite, db, upd.String())
+		b.StopTimer()
+		b.ReportMetric(float64(d.Microseconds())/float64(rows), "us/update")
+	}
+}
+
+func BenchmarkDoltliteTextPKUpdateSeparate(b *testing.B) {
+	b.StopTimer()
+	benchUpdateShape(b, false)
+}
+
+func BenchmarkDoltliteTextPKUpdateCASE(b *testing.B) {
+	b.StopTimer()
+	benchUpdateShape(b, true)
+}

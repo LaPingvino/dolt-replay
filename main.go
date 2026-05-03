@@ -680,11 +680,14 @@ var (
 
 func applyToDoltlite(db, sql, msg, author, email, date string, rc repairCtx) error {
 	stmts := splitStatements(sql)
-	preCoalesce := len(stmts)
+	preInsert := len(stmts)
 	stmts = coalesceInserts(stmts, 200)
-	if preCoalesce != len(stmts) {
-		fmt.Fprintf(os.Stderr, "    [coalesced %d INSERTs → %d statements]\n",
-			preCoalesce, len(stmts))
+	preUpdate := len(stmts)
+	stmts = coalesceUpdates(stmts, 500)
+	if preInsert != len(stmts) {
+		fmt.Fprintf(os.Stderr, "    [coalesced %d → %d (inserts: %d→%d, updates: %d→%d)]\n",
+			preInsert, len(stmts),
+			preInsert, preUpdate, preUpdate, len(stmts))
 	}
 	fmt.Fprintf(os.Stderr, "    [%d statements → %d chunks of <=%d, BEGIN/COMMIT wrapped]\n",
 		len(stmts), (len(stmts)+chunkSize-1)/chunkSize, chunkSize)
@@ -1020,6 +1023,83 @@ func splitStatements(sql string) []string {
 	if t := strings.TrimSpace(cur.String()); t != "" {
 		out = append(out, t)
 	}
+	return out
+}
+
+// reUpdateOne matches `UPDATE <tbl> SET <col>=<val> WHERE <pkcol>=<key>` —
+// the per-row UPDATE shape `dolt diff -r sql` emits when a single column
+// changes per row. Captures (table, set-col, value, where-col, key). The
+// value and key are .+? lazy matches, so `WHERE` inside a string literal is
+// not handled — coalesceUpdates falls back to passing the statement through
+// unchanged in that case (correctness preserved, just no batching).
+var reUpdateOne = regexp.MustCompile(`(?is)^\s*UPDATE\s+(` + "`[^`]+`" + `|"[^"]+"|\w+)\s+SET\s+(` + "`[^`]+`" + `|"[^"]+"|\w+)\s*=\s*(.+?)\s+WHERE\s+(` + "`[^`]+`" + `|"[^"]+"|\w+)\s*=\s*(.+?)\s*;?\s*$`)
+
+// coalesceUpdates merges runs of single-column-by-PK UPDATEs against the same
+// table into one CASE-batched statement, capped at maxRows entries. doltlite
+// flushes its mutmap roughly per statement, so 1500 individual UPDATEs cost
+// 1500 mergeWalks + 1500 implicit-savepoint flushes; one CASE statement
+// updating the same 1500 rows costs one of each.
+//
+// Output shape:
+//   UPDATE <tbl> SET <col> = CASE <pkcol> WHEN <k1> THEN <v1> ... ELSE <col> END
+//     WHERE <pkcol> IN (<k1>, <k2>, ...)
+//
+// The ELSE <col> clause keeps existing values intact for any row whose key
+// happens to match no WHEN (impossible given the IN filter, but defensive
+// against a doltlite planner that evaluates CASE for the whole table).
+func coalesceUpdates(stmts []string, maxRows int) []string {
+	if maxRows < 2 {
+		return stmts
+	}
+	out := make([]string, 0, len(stmts))
+	var (
+		runKey                         string
+		runTbl, runSetCol, runWhereCol string
+		runOriginal                    []string // original statement strings, for verbatim singleton emit
+		runWhens                       []string // "WHEN <key> THEN <val>"
+		runKeys                        []string // <key> verbatim
+	)
+	flush := func() {
+		switch len(runOriginal) {
+		case 0:
+			return
+		case 1:
+			out = append(out, runOriginal[0])
+		default:
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "UPDATE %s SET %s = CASE %s ", runTbl, runSetCol, runWhereCol)
+			for _, w := range runWhens {
+				sb.WriteString(w)
+				sb.WriteByte(' ')
+			}
+			fmt.Fprintf(&sb, "ELSE %s END WHERE %s IN (%s)",
+				runSetCol, runWhereCol, strings.Join(runKeys, ", "))
+			out = append(out, sb.String())
+		}
+		runKey, runTbl, runSetCol, runWhereCol = "", "", "", ""
+		runOriginal, runWhens, runKeys = nil, nil, nil
+	}
+	for _, s := range stmts {
+		m := reUpdateOne.FindStringSubmatch(s)
+		if m == nil {
+			flush()
+			out = append(out, s)
+			continue
+		}
+		tbl, setCol, val, whereCol, key := m[1], m[2], m[3], m[4], m[5]
+		key = strings.TrimRight(strings.TrimSpace(key), ";")
+		val = strings.TrimSpace(val)
+		groupKey := tbl + "\x00" + setCol + "\x00" + whereCol
+		if groupKey != runKey || len(runWhens) >= maxRows {
+			flush()
+			runKey = groupKey
+			runTbl, runSetCol, runWhereCol = tbl, setCol, whereCol
+		}
+		runOriginal = append(runOriginal, strings.TrimRight(strings.TrimSpace(s), ";"))
+		runWhens = append(runWhens, fmt.Sprintf("WHEN %s THEN %s", key, val))
+		runKeys = append(runKeys, key)
+	}
+	flush()
 	return out
 }
 

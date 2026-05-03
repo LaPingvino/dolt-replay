@@ -195,6 +195,105 @@ func TestCoalesceInserts(t *testing.T) {
 	}
 }
 
+func TestCoalesceUpdates(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      []string
+		maxRows int
+		want    []string
+	}{
+		{
+			"two same-shape updates merge into CASE",
+			[]string{
+				"UPDATE `writings` SET `phelps`='BH00001' WHERE `version`='uuid-1'",
+				"UPDATE `writings` SET `phelps`='BH00002' WHERE `version`='uuid-2'",
+			},
+			10,
+			[]string{
+				"UPDATE `writings` SET `phelps` = CASE `version` WHEN 'uuid-1' THEN 'BH00001' WHEN 'uuid-2' THEN 'BH00002' ELSE `phelps` END WHERE `version` IN ('uuid-1', 'uuid-2')",
+			},
+		},
+		{
+			"different SET column does not merge",
+			[]string{
+				"UPDATE `t` SET `a`='x' WHERE `pk`=1",
+				"UPDATE `t` SET `b`='y' WHERE `pk`=2",
+			},
+			10,
+			[]string{
+				"UPDATE `t` SET `a`='x' WHERE `pk`=1",
+				"UPDATE `t` SET `b`='y' WHERE `pk`=2",
+			},
+		},
+		{
+			"different WHERE column does not merge",
+			[]string{
+				"UPDATE `t` SET `a`='x' WHERE `pk`=1",
+				"UPDATE `t` SET `a`='y' WHERE `other`=2",
+			},
+			10,
+			[]string{
+				"UPDATE `t` SET `a`='x' WHERE `pk`=1",
+				"UPDATE `t` SET `a`='y' WHERE `other`=2",
+			},
+		},
+		{
+			"single update emits original verbatim (no CASE wrapper)",
+			[]string{"UPDATE `t` SET `a`='x' WHERE `pk`=1"},
+			10,
+			[]string{"UPDATE `t` SET `a`='x' WHERE `pk`=1"},
+		},
+		{
+			"non-update statement breaks the run",
+			[]string{
+				"UPDATE `t` SET `a`='x' WHERE `pk`=1",
+				"UPDATE `t` SET `a`='y' WHERE `pk`=2",
+				"DELETE FROM `t` WHERE `pk`=3",
+				"UPDATE `t` SET `a`='z' WHERE `pk`=4",
+			},
+			10,
+			[]string{
+				"UPDATE `t` SET `a` = CASE `pk` WHEN 1 THEN 'x' WHEN 2 THEN 'y' ELSE `a` END WHERE `pk` IN (1, 2)",
+				"DELETE FROM `t` WHERE `pk`=3",
+				"UPDATE `t` SET `a`='z' WHERE `pk`=4",
+			},
+		},
+		{
+			"maxRows caps merged group",
+			[]string{
+				"UPDATE `t` SET `a`='x' WHERE `pk`=1",
+				"UPDATE `t` SET `a`='y' WHERE `pk`=2",
+				"UPDATE `t` SET `a`='z' WHERE `pk`=3",
+			},
+			2,
+			[]string{
+				"UPDATE `t` SET `a` = CASE `pk` WHEN 1 THEN 'x' WHEN 2 THEN 'y' ELSE `a` END WHERE `pk` IN (1, 2)",
+				"UPDATE `t` SET `a`='z' WHERE `pk`=3",
+			},
+		},
+		{
+			"maxRows<2 disables coalescing",
+			[]string{
+				"UPDATE `t` SET `a`='x' WHERE `pk`=1",
+				"UPDATE `t` SET `a`='y' WHERE `pk`=2",
+			},
+			1,
+			[]string{
+				"UPDATE `t` SET `a`='x' WHERE `pk`=1",
+				"UPDATE `t` SET `a`='y' WHERE `pk`=2",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := coalesceUpdates(tc.in, tc.maxRows)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %#v\nwant %#v", got, tc.want)
+			}
+		})
+	}
+}
+
 // ---------- translateForSQLite ----------
 
 func TestTranslateForSQLite(t *testing.T) {
