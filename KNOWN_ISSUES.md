@@ -1,5 +1,43 @@
 # Known Issues
 
+## Upstream dolt: `dolt diff -r sql` drops data when commit also has schema changes
+
+**Repro**: take any commit that includes both `ALTER TABLE X ADD COLUMN`
+and significant row churn on `X` (e.g. the bahaiwritings `uibsgeher`
+"Rebuild prayer_book_structure" commit: ALTERs + 5,123 DELETEs +
+2,325 INSERTs).
+
+- `dolt diff --stat <parent> <commit>` reports the row counts correctly.
+- `dolt diff -r sql <parent> <commit>` emits **only** the ALTERs — every
+  DELETE/INSERT/UPDATE row-level statement is silently swallowed.
+
+**Impact on bahaiwritings clone**: `prayer_book_structure` ends up +4,952
+rows (29% over source) — almost exactly the 5,123 DELETEs the rebuild
+commit dropped. Tables without combined-schema-and-data commits clone
+byte-for-byte (`inventory`, `languages`, ...).
+
+**Workarounds** (none implemented):
+1. After a commit that contains an `ALTER TABLE X …`, re-sync `X` rows
+   (delete-where-not-in-source plus insert-where-not-in-target). Heavy.
+2. Use `dolt sql -q "SELECT * FROM dolt_diff_X AS OF '<commit>'"` to
+   read deltas independently of the SQL emitter; would need a row→SQL
+   translator.
+3. File upstream — failure mode is in the SQL emitter, not the stored
+   delta (`--stat` sees the rows fine).
+
+## Local: `INSERT OR IGNORE` in PK rebuild drops NOT-NULL-violating rows
+
+When the new schema declares `NOT NULL` on a column where some old rows
+have `NULL`, the rebuild's `INSERT OR IGNORE` drops them. On
+bahaiwritings, this costs ~482 `writings` rows at the
+`il22vdccku` "Change primary key to version" commit (1% under source).
+
+**Workaround** (none implemented): backfill `NULL` versions with synthetic
+UUIDs in the rebuild SELECT — source did this implicitly via dolt's MySQL
+`DEFAULT uuid()` evaluated at ALTER time; doltlite stores the default as
+the literal string `'uuid()'` because it doesn't recognize the function
+form, so the default never fires for backfill.
+
 ## SQLite/doltlite DDL gaps (full-clone limitation)
 
 When replaying `dolt → doltlite`, several MySQL DDLs have no direct
