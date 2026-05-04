@@ -151,6 +151,39 @@ func runReplayDoltliteToDolt(t *testing.T, replayBin, src, dstDir, table string)
 	return string(out), err
 }
 
+func runReplayDoltToDoltlite(t *testing.T, replayBin, srcDir, dst, table string) (string, error) {
+	t.Helper()
+	cmd := exec.Command(replayBin,
+		"--src-kind", "dolt", "--src", srcDir,
+		"--dst-kind", "doltlite", "--dst", dst,
+		"--table", table, "--limit", "1000")
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func runReplayDoltToDolt(t *testing.T, replayBin, srcDir, dstDir, table string) (string, error) {
+	t.Helper()
+	cmd := exec.Command(replayBin,
+		"--src-kind", "dolt", "--src", srcDir,
+		"--dst-kind", "dolt", "--dst", dstDir,
+		"--table", table, "--limit", "1000")
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// doltSQLcheck runs SQL against a dolt repo. The SQL may contain
+// dolt_commit calls.
+func doltSQLcheck(t *testing.T, dir, sql string) string {
+	t.Helper()
+	cmd := exec.Command("dolt", "sql", "-q", sql)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dolt sql in %s\nSQL: %s\nERR: %v\nOUT: %s", dir, sql, err, out)
+	}
+	return string(out)
+}
+
 func freshDoltliteSrc(t *testing.T, name string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -218,6 +251,48 @@ func runBothDirections(t *testing.T, table, orderByCol string, want []string,
 	})
 }
 
+// runBothDirectionsFromDolt mirrors runBothDirections for dolt-source
+// tests. setupSrc is called with a freshly-initialized dolt repo and
+// should run `dolt sql` / `dolt commit` to build history.
+func runBothDirectionsFromDolt(t *testing.T, table, orderByCol string, want []string,
+	setupSrc func(t *testing.T, srcDir string)) {
+	t.Helper()
+
+	t.Run("dolt_to_dlite", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setupSrc(t, srcDir)
+
+		dst := filepath.Join(t.TempDir(), "dst.dl")
+		out, err := runReplayDoltToDoltlite(t, replayBin, srcDir, dst, table)
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		got := dliteRows(t, dst, table, orderByCol)
+		if !equalLines(want, got) {
+			t.Errorf("doltlite target rows = %v\nwant = %v\nreplay output:\n%s",
+				got, want, out)
+		}
+	})
+
+	t.Run("dolt_to_dolt", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setupSrc(t, srcDir)
+
+		dstDir := freshDoltDir(t)
+		out, err := runReplayDoltToDolt(t, replayBin, srcDir, dstDir, table)
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		got := doltRows(t, dstDir, table, orderByCol)
+		if !equalLines(want, got) {
+			t.Errorf("dolt target rows = %v\nwant = %v\nreplay output:\n%s",
+				got, want, out)
+		}
+	})
+}
+
 // ---------------- tests ----------------
 
 // TestReplaySchema_Simple: schema-unchanged history replays cleanly in
@@ -234,6 +309,22 @@ SELECT dolt_commit('-Am','seed');`)
 			dliteSQLcheck(t, src, `INSERT INTO t VALUES (4,'d');
 DELETE FROM t WHERE id=1;
 SELECT dolt_commit('-Am','add+remove');`)
+		})
+}
+
+// TestReplaySchema_DoltSrc_Simple: dolt-source baseline with no schema
+// changes. Confirms the dolt-source path handles the no-schema-change
+// case before we tackle the upstream #10988 silent-skip on schema-change
+// commits from the dolt side.
+func TestReplaySchema_DoltSrc_Simple(t *testing.T) {
+	runBothDirectionsFromDolt(t, "t", "id", []string{"2|b", "3|c", "4|d"},
+		func(t *testing.T, srcDir string) {
+			doltSQLcheck(t, srcDir, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c');
+CALL DOLT_COMMIT('-Am','seed');`)
+			doltSQLcheck(t, srcDir, `INSERT INTO t VALUES (4,'d');
+DELETE FROM t WHERE id=1;
+CALL DOLT_COMMIT('-Am','add+remove');`)
 		})
 }
 
