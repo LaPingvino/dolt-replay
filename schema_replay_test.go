@@ -424,6 +424,67 @@ SELECT dolt_commit('-Am','rename');`)
 		})
 }
 
+// TestReplaySchema_MultiTable: two tables change in the same history.
+// Replay with --table="" (all tables) and verify both end states.
+func TestReplaySchema_MultiTable(t *testing.T) {
+	setup := func(t *testing.T, src string) {
+		dliteSQLcheck(t, src, `CREATE TABLE a(id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE b(id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO a VALUES (1,'x'),(2,'y');
+INSERT INTO b VALUES (10, 100),(20, 200);
+SELECT dolt_commit('-Am','seed both');`)
+		dliteCommitSep(t)
+		dliteSQLcheck(t, src, `INSERT INTO a VALUES (3,'z');
+UPDATE b SET val=999 WHERE id=10;
+SELECT dolt_commit('-Am','update both');`)
+	}
+
+	check := func(t *testing.T, readA, readB func() []string) {
+		gotA := readA()
+		wantA := []string{"1|x", "2|y", "3|z"}
+		if !equalLines(wantA, gotA) {
+			t.Errorf("table a rows = %v, want %v", gotA, wantA)
+		}
+		gotB := readB()
+		wantB := []string{"10|999", "20|200"}
+		if !equalLines(wantB, gotB) {
+			t.Errorf("table b rows = %v, want %v", gotB, wantB)
+		}
+	}
+
+	t.Run("dlite_to_dlite", func(t *testing.T) {
+		replayBin := requireDoltliteOnly(t)
+		src := freshDoltliteSrc(t, "src.dl")
+		setup(t, src)
+
+		dst := filepath.Join(filepath.Dir(src), "dst.dl")
+		out, err := runReplayDoltliteToDoltlite(t, replayBin, src, dst, "")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		check(t,
+			func() []string { return dliteRows(t, dst, "a", "id") },
+			func() []string { return dliteRows(t, dst, "b", "id") },
+		)
+	})
+
+	t.Run("dlite_to_dolt", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		src := freshDoltliteSrc(t, "src.dl")
+		setup(t, src)
+
+		dstDir := freshDoltDir(t)
+		out, err := runReplayDoltliteToDolt(t, replayBin, src, dstDir, "")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		check(t,
+			func() []string { return doltRows(t, dstDir, "a", "id") },
+			func() []string { return doltRows(t, dstDir, "b", "id") },
+		)
+	})
+}
+
 // TestReplaySchema_DropTable: DROP TABLE on a table that previously
 // had data. Target should end up without the table (or with it gone
 // after the second commit applies). Single-table replay (--table t)

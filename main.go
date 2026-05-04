@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -439,6 +440,56 @@ func doltliteToSchemaCols(db, parent, child, table string) ([]string, error) {
 		return out, nil
 	}
 	return nil, nil
+}
+
+// doltliteChangedTables enumerates user tables that are candidates for
+// having a parent→child diff. Union of: tables with a row in
+// dolt_schema_diff (schema changed) and user tables visible at HEAD via
+// sqlite_master. Misses tables that existed at child but were dropped
+// post-child; acceptable for current uses.
+func doltliteChangedTables(db, parent, child string) ([]string, error) {
+	seen := map[string]bool{}
+
+	q := fmt.Sprintf(
+		"SELECT table_name FROM dolt_schema_diff WHERE from_ref='%s' AND to_ref='%s'",
+		parent, child)
+	if out, _, err := run("", "", "doltlite", "-csv", "-header", db, q); err == nil {
+		cr := csv.NewReader(strings.NewReader(out))
+		cr.FieldsPerRecord = -1
+		rows, _ := cr.ReadAll()
+		for i, r := range rows {
+			if i == 0 || len(r) == 0 {
+				continue
+			}
+			if t := strings.TrimSpace(r[0]); t != "" {
+				seen[t] = true
+			}
+		}
+	}
+
+	out2, _, err := run("", "", "doltlite", "-csv", "-header", db,
+		"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'dolt!_%' ESCAPE '!' AND name NOT LIKE 'sqlite!_%' ESCAPE '!'")
+	if err != nil {
+		return nil, err
+	}
+	cr2 := csv.NewReader(strings.NewReader(out2))
+	cr2.FieldsPerRecord = -1
+	rows2, _ := cr2.ReadAll()
+	for i, r := range rows2 {
+		if i == 0 || len(r) == 0 {
+			continue
+		}
+		if t := strings.TrimSpace(r[0]); t != "" {
+			seen[t] = true
+		}
+	}
+
+	tables := make([]string, 0, len(seen))
+	for t := range seen {
+		tables = append(tables, t)
+	}
+	sort.Strings(tables)
+	return tables, nil
 }
 
 func doltliteDiffSQL(db, parent, child, table string) (string, error) {
@@ -1659,10 +1710,24 @@ func main() {
 			sql, err = doltDiffSQL(*src, c.Parent, c.Hash, *table)
 		} else {
 			if *table == "" {
-				fmt.Fprintln(os.Stderr, "doltlite source requires --table (whole-commit diff not implemented for doltlite)")
-				os.Exit(2)
+				tables, terr := doltliteChangedTables(*src, c.Parent, c.Hash)
+				if terr != nil {
+					fmt.Fprintln(os.Stderr, terr)
+					os.Exit(1)
+				}
+				var sb strings.Builder
+				for _, t := range tables {
+					tsql, terr := doltliteDiffSQL(*src, c.Parent, c.Hash, t)
+					if terr != nil {
+						fmt.Fprintln(os.Stderr, terr)
+						os.Exit(1)
+					}
+					sb.WriteString(tsql)
+				}
+				sql = sb.String()
+			} else {
+				sql, err = doltliteDiffSQL(*src, c.Parent, c.Hash, *table)
 			}
-			sql, err = doltliteDiffSQL(*src, c.Parent, c.Hash, *table)
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
