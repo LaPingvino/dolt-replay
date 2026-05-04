@@ -19,7 +19,7 @@ Each row is a case category. Each column is a (src-kind, dst-kind) pair. Cell va
 | AddWithDefault (case 1)     | ⏭ | ⏭ | ⏭ | ⏭ |
 | DropThenAdd (case 2)        | ⏭ | ⏭ | ⏭ | ⏭ |
 | DropOnly                    | ✅ | ✅ | ✅ | ✅ |
-| RenameColumn                | ⏭ | ⏭ | — | — |
+| RenameColumn                | ⏭ | ⏭ | ✅ | ✅ |
 | TypeWidening                | ⏭ | ⏭ | ✅ | ✅ |
 | TypeNarrowing (overflow)    | — | — | — | — |
 | DropTable                   | ✅ | ✅ | ✅ | ✅ |

@@ -694,6 +694,53 @@ CALL DOLT_COMMIT('-Am','drop and add');`)
 		})
 }
 
+// TestReplaySchema_DoltSrc_RenameColumn: dolt-source ALTER RENAME
+// COLUMN. `dolt diff -r sql` natively emits RENAME COLUMN, so the
+// dolt→dolt direction should work; dolt→dlite hinges on whether the
+// dialect translation passes the rename through and doltlite/SQLite
+// accepts it.
+func TestReplaySchema_DoltSrc_RenameColumn(t *testing.T) {
+	setup := func(t *testing.T, srcDir string) {
+		doltSQLcheck(t, srcDir, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t VALUES (1,'alpha'),(2,'beta');
+CALL DOLT_COMMIT('-Am','seed');`)
+		doltSQLcheck(t, srcDir, `ALTER TABLE t RENAME COLUMN name TO label;
+CALL DOLT_COMMIT('-Am','rename');`)
+	}
+
+	t.Run("dolt_to_dlite", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dst := filepath.Join(t.TempDir(), "dst.dl")
+		out, err := runReplayDoltToDoltlite(t, replayBin, srcDir, dst, "t")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		got := dliteRows(t, dst, "t", "id")
+		if !equalLines([]string{"1|alpha", "2|beta"}, got) {
+			t.Errorf("rows = %v\nreplay:\n%s", got, out)
+		}
+	})
+
+	t.Run("dolt_to_dolt", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dstDir := freshDoltDir(t)
+		out, err := runReplayDoltToDolt(t, replayBin, srcDir, dstDir, "t")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		got := doltRows(t, dstDir, "t", "id")
+		if !equalLines([]string{"1|alpha", "2|beta"}, got) {
+			t.Errorf("rows = %v\nreplay:\n%s", got, out)
+		}
+	})
+}
+
 // TestReplaySchema_DoltSrc_TypeWidening: dolt-source MODIFY COLUMN to
 // widen the type. Dolt supports MODIFY COLUMN natively, so the source
 // commit can be set up. The replay then either preserves the widened
