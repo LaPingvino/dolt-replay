@@ -694,6 +694,185 @@ CALL DOLT_COMMIT('-Am','drop and add');`)
 		})
 }
 
+// TestReplaySchema_DoltSrc_DropTable: dolt-source DROP TABLE on a
+// previously-populated table. Pure-schema in the drop commit; no
+// upstream silent-skip hit.
+func TestReplaySchema_DoltSrc_DropTable(t *testing.T) {
+	setup := func(t *testing.T, srcDir string) {
+		doltSQLcheck(t, srcDir, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t VALUES (1,'a'),(2,'b');
+CALL DOLT_COMMIT('-Am','seed');`)
+		doltSQLcheck(t, srcDir, `DROP TABLE t;
+CALL DOLT_COMMIT('-Am','drop table');`)
+	}
+
+	t.Run("dolt_to_dlite", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dst := filepath.Join(t.TempDir(), "dst.dl")
+		out, err := runReplayDoltToDoltlite(t, replayBin, srcDir, dst, "t")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		cmd := exec.Command("doltlite", "-csv", "-header", dst,
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='t'")
+		chk, _ := cmd.CombinedOutput()
+		gotLines := strings.Split(strings.TrimSpace(string(chk)), "\n")
+		if len(gotLines) > 1 {
+			t.Errorf("table 't' still exists on doltlite target\nintrospect: %s\nreplay output:\n%s",
+				chk, out)
+		}
+	})
+
+	t.Run("dolt_to_dolt", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dstDir := freshDoltDir(t)
+		out, err := runReplayDoltToDolt(t, replayBin, srcDir, dstDir, "t")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		cmd := exec.Command("dolt", "sql", "-r", "csv", "-q",
+			"SELECT table_name FROM information_schema.tables WHERE table_name='t' AND table_schema=database()")
+		cmd.Dir = dstDir
+		chk, _ := cmd.CombinedOutput()
+		gotLines := strings.Split(strings.TrimSpace(string(chk)), "\n")
+		if len(gotLines) > 1 {
+			t.Errorf("table 't' still exists on dolt target\nintrospect: %s\nreplay output:\n%s",
+				chk, out)
+		}
+	})
+}
+
+// TestReplaySchema_DoltSrc_MultiTable: dolt-source two tables changing
+// in the same history.
+func TestReplaySchema_DoltSrc_MultiTable(t *testing.T) {
+	setup := func(t *testing.T, srcDir string) {
+		doltSQLcheck(t, srcDir, `CREATE TABLE a(id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE b(id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO a VALUES (1,'x'),(2,'y');
+INSERT INTO b VALUES (10, 100),(20, 200);
+CALL DOLT_COMMIT('-Am','seed both');`)
+		doltSQLcheck(t, srcDir, `INSERT INTO a VALUES (3,'z');
+UPDATE b SET val=999 WHERE id=10;
+CALL DOLT_COMMIT('-Am','update both');`)
+	}
+
+	t.Run("dolt_to_dlite", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dst := filepath.Join(t.TempDir(), "dst.dl")
+		out, err := runReplayDoltToDoltlite(t, replayBin, srcDir, dst, "")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		gotA := dliteRows(t, dst, "a", "id")
+		if !equalLines([]string{"1|x", "2|y", "3|z"}, gotA) {
+			t.Errorf("a = %v", gotA)
+		}
+		gotB := dliteRows(t, dst, "b", "id")
+		if !equalLines([]string{"10|999", "20|200"}, gotB) {
+			t.Errorf("b = %v\nreplay:\n%s", gotB, out)
+		}
+	})
+
+	t.Run("dolt_to_dolt", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dstDir := freshDoltDir(t)
+		out, err := runReplayDoltToDolt(t, replayBin, srcDir, dstDir, "")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		gotA := doltRows(t, dstDir, "a", "id")
+		if !equalLines([]string{"1|x", "2|y", "3|z"}, gotA) {
+			t.Errorf("a = %v", gotA)
+		}
+		gotB := doltRows(t, dstDir, "b", "id")
+		if !equalLines([]string{"10|999", "20|200"}, gotB) {
+			t.Errorf("b = %v\nreplay:\n%s", gotB, out)
+		}
+	})
+}
+
+// TestReplaySchema_DoltSrc_CreateTableMidHistory: dolt-source second
+// table introduced partway through history.
+func TestReplaySchema_DoltSrc_CreateTableMidHistory(t *testing.T) {
+	setup := func(t *testing.T, srcDir string) {
+		doltSQLcheck(t, srcDir, `CREATE TABLE a(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO a VALUES (1,'x');
+CALL DOLT_COMMIT('-Am','seed a');`)
+		doltSQLcheck(t, srcDir, `CREATE TABLE b(id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO b VALUES (10, 100);
+CALL DOLT_COMMIT('-Am','add b');`)
+		doltSQLcheck(t, srcDir, `INSERT INTO a VALUES (2,'y');
+INSERT INTO b VALUES (20, 200);
+CALL DOLT_COMMIT('-Am','data both');`)
+	}
+
+	t.Run("dolt_to_dlite", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dst := filepath.Join(t.TempDir(), "dst.dl")
+		out, err := runReplayDoltToDoltlite(t, replayBin, srcDir, dst, "")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		gotA := dliteRows(t, dst, "a", "id")
+		if !equalLines([]string{"1|x", "2|y"}, gotA) {
+			t.Errorf("a = %v\nreplay:\n%s", gotA, out)
+		}
+		gotB := dliteRows(t, dst, "b", "id")
+		if !equalLines([]string{"10|100", "20|200"}, gotB) {
+			t.Errorf("b = %v\nreplay:\n%s", gotB, out)
+		}
+	})
+
+	t.Run("dolt_to_dolt", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dstDir := freshDoltDir(t)
+		out, err := runReplayDoltToDolt(t, replayBin, srcDir, dstDir, "")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		gotA := doltRows(t, dstDir, "a", "id")
+		if !equalLines([]string{"1|x", "2|y"}, gotA) {
+			t.Errorf("a = %v", gotA)
+		}
+		gotB := doltRows(t, dstDir, "b", "id")
+		if !equalLines([]string{"10|100", "20|200"}, gotB) {
+			t.Errorf("b = %v", gotB)
+		}
+	})
+}
+
+// TestReplaySchema_DoltSrc_RowOrderingPreserved: dolt-source non-PK-
+// sorted insertion order across commits.
+func TestReplaySchema_DoltSrc_RowOrderingPreserved(t *testing.T) {
+	runBothDirectionsFromDolt(t, "t", "id",
+		[]string{"1|alpha", "2|beta", "3|gamma", "4|delta", "5|epsilon"},
+		func(t *testing.T, srcDir string) {
+			doltSQLcheck(t, srcDir, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t VALUES (3,'gamma'),(1,'alpha'),(5,'epsilon');
+CALL DOLT_COMMIT('-Am','seed out-of-order');`)
+			doltSQLcheck(t, srcDir, `INSERT INTO t VALUES (4,'delta'),(2,'beta');
+CALL DOLT_COMMIT('-Am','add interior rows');`)
+		})
+}
+
 // TestReplaySchema_DoltSrc_DropOnly: dolt-source DROP COLUMN with no
 // accompanying data changes. Pure-schema commits should be safe even
 // under the upstream silent-skip bug since there's no data DML to drop.
