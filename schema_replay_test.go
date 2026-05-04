@@ -419,6 +419,20 @@ SELECT dolt_commit('-Am','drop column');`)
 		})
 }
 
+// TestReplaySchema_DoltSrc_DropOnly: dolt-source DROP COLUMN with no
+// accompanying data changes. Pure-schema commits should be safe even
+// under the upstream silent-skip bug since there's no data DML to drop.
+func TestReplaySchema_DoltSrc_DropOnly(t *testing.T) {
+	runBothDirectionsFromDolt(t, "t", "id", []string{"1|a", "2|b"},
+		func(t *testing.T, srcDir string) {
+			doltSQLcheck(t, srcDir, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, extra TEXT);
+INSERT INTO t VALUES (1,'a','x'),(2,'b','y');
+CALL DOLT_COMMIT('-Am','seed');`)
+			doltSQLcheck(t, srcDir, `ALTER TABLE t DROP COLUMN extra;
+CALL DOLT_COMMIT('-Am','drop column');`)
+		})
+}
+
 func equalLines(a, b []string) bool {
 	if len(a) == 0 && len(b) == 0 {
 		return true
