@@ -116,21 +116,108 @@ func doltLog(repo string, limit int) ([]Commit, error) {
 
 // doltDiffSQL emits diff SQL between parent..child. If table=="" the diff
 // covers every changed table (CREATE TABLE included for first appearance).
+//
+// When `dolt diff -r sql` reports "Incompatible schema change, skipping data
+// diff" (upstream dolthub/dolt#10988), the data DML is silently dropped from
+// the output. To recover it we re-extract via the schema-rebase trick:
+//   1. Branch from parent into a temporary branch.
+//   2. Apply parent→child's schema change to that branch.
+//   3. Diff that branch against child for data — schemas now match, so the
+//      "incompatible schema change" guard no longer fires.
+// The two halves (schema SQL + data SQL) are concatenated.
 func doltDiffSQL(repo, parent, child, table string) (string, error) {
 	args := []string{"diff", "-r", "sql", parent, child}
 	if table != "" {
 		args = append(args, "--", table)
 	}
-	out, errs, err := run(repo, "", "dolt", args...)
+	rawOut, errs, err := run(repo, "", "dolt", args...)
 	if err != nil {
 		if strings.Contains(errs, "does not exist") {
 			return "", nil
 		}
 		return "", fmt.Errorf("dolt diff: %v\n%s", err, errs)
 	}
-	out = stripDoltDiffNoise(out)
+
+	if strings.Contains(errs, "Incompatible schema change, skipping data diff") || strings.Contains(rawOut, "Incompatible schema change, skipping data diff") {
+		rebased, rerr := doltDiffSQLViaRebase(repo, parent, child, table)
+		if rerr == nil {
+			return rebased, nil
+		}
+		// On rebase failure fall through to the noise-stripped raw output —
+		// at least the schema portion still applies.
+	}
+
+	out := stripDoltDiffNoise(rawOut)
 	out = rewriteColumnSwaps(out)
 	return out, nil
+}
+
+// doltDiffSQLViaRebase implements the schema-then-diff-against-rebased-
+// baseline approach for combined schema-and-data commits. Mutates the
+// source repo's branch state via a transient `__replay_baseline` branch;
+// the caller should treat that branch as a temporary that may be reused
+// across commits.
+func doltDiffSQLViaRebase(repo, parent, child, table string) (string, error) {
+	schemaArgs := []string{"diff", "--schema", "-r", "sql", parent, child}
+	if table != "" {
+		schemaArgs = append(schemaArgs, "--", table)
+	}
+	rawSchema, errs, err := run(repo, "", "dolt", schemaArgs...)
+	if err != nil {
+		return "", fmt.Errorf("dolt diff --schema: %v\n%s", err, errs)
+	}
+	schemaSQL := stripDoltDiffNoise(rawSchema)
+	schemaSQL = rewriteColumnSwaps(schemaSQL)
+
+	curBranch, _, _ := run(repo, "", "dolt", "sql", "-r", "csv", "-q", "SELECT active_branch()")
+	curBranch = parseSingleCSVValue(curBranch)
+	if curBranch == "" {
+		curBranch = "main"
+	}
+
+	if _, _, err := run(repo, "", "dolt", "branch", "-f", "__replay_baseline", parent); err != nil {
+		return "", fmt.Errorf("create __replay_baseline: %v", err)
+	}
+	if _, _, err := run(repo, "", "dolt", "checkout", "__replay_baseline"); err != nil {
+		return "", fmt.Errorf("checkout __replay_baseline: %v", err)
+	}
+	defer run(repo, "", "dolt", "checkout", curBranch)
+
+	// Apply the schema-only SQL; trim NULLs to avoid syntax errors when
+	// schemaSQL is empty.
+	if strings.TrimSpace(schemaSQL) != "" {
+		if _, errs, err := run(repo, "SET FOREIGN_KEY_CHECKS=0;\n"+schemaSQL+"\nSET FOREIGN_KEY_CHECKS=1;\n", "dolt", "sql"); err != nil {
+			return "", fmt.Errorf("apply schema to baseline: %v\n%s", err, errs)
+		}
+		if _, _, err := run(repo, "", "dolt", "add", "-A"); err != nil {
+			return "", err
+		}
+		if _, errs, err := run(repo, "", "dolt", "commit", "-m", "schema-rebase baseline", "--allow-empty"); err != nil {
+			if !strings.Contains(errs, "nothing to commit") && !strings.Contains(errs, "no changes added") {
+				return "", fmt.Errorf("commit baseline: %v\n%s", err, errs)
+			}
+		}
+	}
+
+	dataArgs := []string{"diff", "--data", "-r", "sql", "__replay_baseline", child}
+	if table != "" {
+		dataArgs = append(dataArgs, "--", table)
+	}
+	rawData, errs, err := run(repo, "", "dolt", dataArgs...)
+	if err != nil {
+		return "", fmt.Errorf("dolt diff --data baseline child: %v\n%s", err, errs)
+	}
+	dataSQL := stripDoltDiffNoise(rawData)
+	dataSQL = rewriteColumnSwaps(dataSQL)
+	return schemaSQL + "\n" + dataSQL, nil
+}
+
+func parseSingleCSVValue(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(strings.Trim(lines[1], "\""))
 }
 
 // stripDoltDiffNoise removes diagnostic lines that `dolt diff -r sql` emits

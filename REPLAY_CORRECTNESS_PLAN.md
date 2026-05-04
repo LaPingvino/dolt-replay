@@ -15,9 +15,9 @@ Each row is a case category. Each column is a (src-kind, dst-kind) pair. Cell va
 | Case                | dlite→dlite | dlite→dolt | dolt→dlite | dolt→dolt |
 |---------------------|:---:|:---:|:---:|:---:|
 | Simple              | ✅ | ✅ | ✅ | ✅ |
-| AddNullable (bahaiwritings) | ✅ | ✅ | ⏭ | ⏭ |
-| AddWithDefault (case 1)     | ⏭ | ⏭ | ⏭ | ⏭ |
-| DropThenAdd (case 2)        | ⏭ | ⏭ | ⏭ | ⏭ |
+| AddNullable (bahaiwritings) | ✅ | ✅ | ✅ | ✅ |
+| AddWithDefault (case 1)     | ✅ | ✅ | ✅ | ✅ |
+| DropThenAdd (case 2)        | ✅ | ✅ | ✅ | ✅ |
 | DropOnly                    | ✅ | ✅ | ✅ | ✅ |
 | RenameColumn                | ✅ | ✅ | ✅ | ✅ |
 | TypeWidening                | ✅ | ✅ | ✅ | ✅ |

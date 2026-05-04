@@ -334,8 +334,6 @@ CALL DOLT_COMMIT('-Am','add+remove');`)
 // but silently drops the data DML, so the target ends up with the new
 // schema but missing the row updates. Documents the source-side gap.
 func TestReplaySchema_DoltSrc_AddNullable(t *testing.T) {
-	t.Skip("known gap: dolt-source `dolt diff -r sql` silently drops data on schema-change commits — see dolthub/dolt#10988. Reproduced: combined commit emits only the ALTER (35 bytes), target ends with new schema but missing row updates.")
-
 	runBothDirectionsFromDolt(t, "t", "id", []string{"1|a|", "2|b|", "6|f|", "7|g|"},
 		func(t *testing.T, srcDir string) {
 			doltSQLcheck(t, srcDir, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
@@ -370,8 +368,6 @@ SELECT dolt_commit('-Am','combined');`)
 // the schema-change commit's effect (nicktobey case 1) — the ALTER's
 // default-population isn't visible at the data-diff layer.
 func TestReplaySchema_AddWithDefault(t *testing.T) {
-	t.Skip("known gap: dolt_diff_<table> doesn't surface ALTER's default-population — see dolthub/dolt#10988 nicktobey case 1")
-
 	runBothDirections(t, "t", "pk", []string{"0|6", "1|6", "2|6"},
 		func(t *testing.T, src string) {
 			dliteSQLcheck(t, src, `CREATE TABLE t(pk INTEGER PRIMARY KEY);
@@ -389,8 +385,6 @@ SELECT dolt_commit('-Am','add column with default');`)
 // (nicktobey case 2). The data emitter has no way to recover the
 // semantic UPDATE that should have replayed.
 func TestReplaySchema_DropThenAdd(t *testing.T) {
-	t.Skip("known gap: positional row-record aliasing hides DROP+ADD same-value semantic — see dolthub/dolt#10988 nicktobey case 2")
-
 	runBothDirections(t, "t", "pk", []string{"0|10"},
 		func(t *testing.T, src string) {
 			dliteSQLcheck(t, src, `CREATE TABLE t(pk INTEGER PRIMARY KEY, a INTEGER);
@@ -679,8 +673,6 @@ SELECT dolt_commit('-Am','drop column');`)
 //   - dolt_diff_<table> not surfacing ALTER's default-population (algorithm)
 // Skipped pending the schema-then-diff-against-rebased-baseline fix.
 func TestReplaySchema_DoltSrc_AddWithDefault(t *testing.T) {
-	t.Skip("known gap: dolt-source path + nicktobey case 1 — see dolthub/dolt#10988")
-
 	runBothDirectionsFromDolt(t, "t", "pk", []string{"0|6", "1|6", "2|6"},
 		func(t *testing.T, srcDir string) {
 			doltSQLcheck(t, srcDir, `CREATE TABLE t(pk INTEGER PRIMARY KEY);
@@ -695,8 +687,6 @@ CALL DOLT_COMMIT('-Am','add column with default');`)
 // case 2. Same cascade — upstream silent-skip plus positional row-record
 // aliasing. Skipped pending the algorithm fix.
 func TestReplaySchema_DoltSrc_DropThenAdd(t *testing.T) {
-	t.Skip("known gap: dolt-source path + nicktobey case 2 — see dolthub/dolt#10988")
-
 	runBothDirectionsFromDolt(t, "t", "pk", []string{"0|10"},
 		func(t *testing.T, srcDir string) {
 			doltSQLcheck(t, srcDir, `CREATE TABLE t(pk INTEGER PRIMARY KEY, a INTEGER);
