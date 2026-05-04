@@ -404,6 +404,26 @@ SELECT dolt_commit('-Am','drop and add');`)
 		})
 }
 
+// TestReplaySchema_RenameColumn: ALTER TABLE RENAME COLUMN. Tests
+// whether the rename surfaces correctly through the diff layer and
+// applies on the target.
+func TestReplaySchema_RenameColumn(t *testing.T) {
+	t.Skip("known gap: pure-rename emits 0-byte diff + seed-leg values lost. " +
+		"deriveAlterFromCreate() only emits ADD/DROP; need either RENAME-aware " +
+		"matching (column-position heuristic, or use dolt_schema_diff column-pair " +
+		"info if available) or fall back to DROP+ADD with data carry-over.")
+
+	runBothDirections(t, "t", "id", []string{"1|alpha", "2|beta"},
+		func(t *testing.T, src string) {
+			dliteSQLcheck(t, src, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t VALUES (1,'alpha'),(2,'beta');
+SELECT dolt_commit('-Am','seed');`)
+			dliteCommitSep(t)
+			dliteSQLcheck(t, src, `ALTER TABLE t RENAME COLUMN name TO label;
+SELECT dolt_commit('-Am','rename');`)
+		})
+}
+
 // TestReplaySchema_DropOnly: DROP COLUMN with no add. Existing rows
 // keep their PK + remaining columns; the dropped column simply goes
 // away on the target.

@@ -19,7 +19,7 @@ Each row is a case category. Each column is a (src-kind, dst-kind) pair. Cell va
 | AddWithDefault (case 1)     | ⏭ | ⏭ | ⏭ | ⏭ |
 | DropThenAdd (case 2)        | ⏭ | ⏭ | ⏭ | ⏭ |
 | DropOnly                    | ✅ | ✅ | ✅ | ✅ |
-| RenameColumn                | — | — | — | — |
+| RenameColumn                | ⏭ | ⏭ | — | — |
 | TypeWidening                | — | — | — | — |
 | TypeNarrowing (overflow)    | — | — | — | — |
 | DropTable                   | — | — | — | — |
@@ -37,7 +37,9 @@ Update this table after each loop tick.
 
 3. **doltliteLog date-sort** (main.go around line 197): doltlite doesn't expose `dolt_commit_ancestors` yet, so the log walker sorts by date with second-resolution timestamps. Commits inside the same second shuffle, breaking parent inference. Workaround in the test suite: `dliteCommitSep(t)` sleeps 1.1s between commits. Real fix: use a parent-aware traversal.
 
-4. **dolt-source path silently drops data** on schema-change commits — same upstream bug as 1+2 viewed from the source side. `dolt diff -r sql` is what we use; it emits only the ALTER, never the data. Until the upstream fix lands, dolt→* tests will fail on schema-change commits unless we work around it ourselves.
+4. **RenameColumn**: `deriveAlterFromCreate` only emits ADD/DROP — pure renames produce a 0-byte diff (the to-create-statement column-name set is interpreted as DROP+ADD only when names actually differ; identical positions/types but renamed yields nothing emitted in the current matcher). Even the seed leg fails because the schema-at-child lookup returns the post-rename column name, so INSERTs target a column the source data doesn't have. Fix: position-based pairing in `deriveAlterFromCreate` to detect renames, or use a richer source signal (column UUIDs in dolt_schema_diff if available).
+
+5. **dolt-source path silently drops data** on schema-change commits — same upstream bug as 1+2 viewed from the source side. `dolt diff -r sql` is what we use; it emits only the ALTER, never the data. Until the upstream fix lands, dolt→* tests will fail on schema-change commits unless we work around it ourselves.
 
 ## The Correct Algorithm (nicktobey, dolthub/dolt#10988)
 
