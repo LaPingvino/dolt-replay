@@ -1133,7 +1133,8 @@ func applyToDolt(repo, sql, msg, author, email, date string) error {
 		args = append(args, "--author", fmt.Sprintf("%s <%s>", author, email))
 	}
 	out, errs, err := run(repo, "", "dolt", args...)
-	if err != nil && !strings.Contains(out+errs, "nothing to commit") {
+	combined := out + errs
+	if err != nil && !strings.Contains(combined, "nothing to commit") && !strings.Contains(combined, "no changes added to commit") {
 		return fmt.Errorf("dolt commit: %v\n%s", err, errs)
 	}
 	return nil

@@ -622,18 +622,21 @@ SELECT dolt_commit('-Am','drop table');`)
 // no value loss expected. Tests whether deriveAlterFromCreate detects
 // type changes and emits something usable.
 func TestReplaySchema_TypeWidening(t *testing.T) {
-	t.Skip("setup blocked: doltlite (SQLite) doesn't support `ALTER TABLE ... MODIFY COLUMN`. " +
-		"Type widening from a doltlite source needs either a SQLite table-rebuild pattern " +
-		"(temp table + INSERT SELECT + RENAME) in the test setup, or skip dlite-source " +
-		"type-widening entirely and only test dolt-source where it works natively.")
-
+	// SQLite doesn't support MODIFY COLUMN; emulate the type change via
+	// the standard table-rebuild pattern (new table + INSERT SELECT +
+	// DROP + RENAME). From the replay's view, this is a same-name same-
+	// position type change — deriveAlterFromCreate emits a schema-comment
+	// rather than an ALTER, but data values still flow through.
 	runBothDirections(t, "t", "id", []string{"1|hello", "2|world"},
 		func(t *testing.T, src string) {
 			dliteSQLcheck(t, src, `CREATE TABLE t(id INTEGER PRIMARY KEY, name VARCHAR(10));
 INSERT INTO t VALUES (1,'hello'),(2,'world');
 SELECT dolt_commit('-Am','seed');`)
 			dliteCommitSep(t)
-			dliteSQLcheck(t, src, `ALTER TABLE t MODIFY COLUMN name VARCHAR(50);
+			dliteSQLcheck(t, src, `CREATE TABLE t_new(id INTEGER PRIMARY KEY, name VARCHAR(50));
+INSERT INTO t_new SELECT * FROM t;
+DROP TABLE t;
+ALTER TABLE t_new RENAME TO t;
 SELECT dolt_commit('-Am','widen');`)
 		})
 }
@@ -641,15 +644,16 @@ SELECT dolt_commit('-Am','widen');`)
 // TestReplaySchema_TypeNarrowing: dlite-source narrow. Same SQLite
 // parser limitation as TypeWidening — MODIFY COLUMN isn't accepted.
 func TestReplaySchema_TypeNarrowing(t *testing.T) {
-	t.Skip("setup blocked: doltlite (SQLite) doesn't support `ALTER TABLE ... MODIFY COLUMN`. Same limitation as TypeWidening; needs SQLite table-rebuild pattern in setup.")
-
 	runBothDirections(t, "t", "id", []string{"1|hi", "2|world"},
 		func(t *testing.T, src string) {
 			dliteSQLcheck(t, src, `CREATE TABLE t(id INTEGER PRIMARY KEY, name VARCHAR(50));
 INSERT INTO t VALUES (1,'hi'),(2,'world');
 SELECT dolt_commit('-Am','seed');`)
 			dliteCommitSep(t)
-			dliteSQLcheck(t, src, `ALTER TABLE t MODIFY COLUMN name VARCHAR(10);
+			dliteSQLcheck(t, src, `CREATE TABLE t_new(id INTEGER PRIMARY KEY, name VARCHAR(10));
+INSERT INTO t_new SELECT * FROM t;
+DROP TABLE t;
+ALTER TABLE t_new RENAME TO t;
 SELECT dolt_commit('-Am','narrow');`)
 		})
 }
