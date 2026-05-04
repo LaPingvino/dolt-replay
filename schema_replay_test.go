@@ -643,6 +643,22 @@ SELECT dolt_commit('-Am','widen');`)
 		})
 }
 
+// TestReplaySchema_TypeNarrowing: dlite-source narrow. Same SQLite
+// parser limitation as TypeWidening — MODIFY COLUMN isn't accepted.
+func TestReplaySchema_TypeNarrowing(t *testing.T) {
+	t.Skip("setup blocked: doltlite (SQLite) doesn't support `ALTER TABLE ... MODIFY COLUMN`. Same limitation as TypeWidening; needs SQLite table-rebuild pattern in setup.")
+
+	runBothDirections(t, "t", "id", []string{"1|hi", "2|world"},
+		func(t *testing.T, src string) {
+			dliteSQLcheck(t, src, `CREATE TABLE t(id INTEGER PRIMARY KEY, name VARCHAR(50));
+INSERT INTO t VALUES (1,'hi'),(2,'world');
+SELECT dolt_commit('-Am','seed');`)
+			dliteCommitSep(t)
+			dliteSQLcheck(t, src, `ALTER TABLE t MODIFY COLUMN name VARCHAR(10);
+SELECT dolt_commit('-Am','narrow');`)
+		})
+}
+
 // TestReplaySchema_DropOnly: DROP COLUMN with no add. Existing rows
 // keep their PK + remaining columns; the dropped column simply goes
 // away on the target.
@@ -692,6 +708,51 @@ ALTER TABLE t ADD COLUMN b INTEGER;
 UPDATE t SET b=10;
 CALL DOLT_COMMIT('-Am','drop and add');`)
 		})
+}
+
+// TestReplaySchema_DoltSrc_TypeNarrowing: dolt-source MODIFY COLUMN to
+// narrow a type that nonetheless fits all current values (no overflow).
+// Should preserve values; the narrower type is just less permissive.
+func TestReplaySchema_DoltSrc_TypeNarrowing(t *testing.T) {
+	setup := func(t *testing.T, srcDir string) {
+		doltSQLcheck(t, srcDir, `CREATE TABLE t(id INTEGER PRIMARY KEY, name VARCHAR(50));
+INSERT INTO t VALUES (1,'hi'),(2,'world');
+CALL DOLT_COMMIT('-Am','seed');`)
+		doltSQLcheck(t, srcDir, `ALTER TABLE t MODIFY COLUMN name VARCHAR(10);
+CALL DOLT_COMMIT('-Am','narrow');`)
+	}
+
+	t.Run("dolt_to_dlite", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dst := filepath.Join(t.TempDir(), "dst.dl")
+		out, err := runReplayDoltToDoltlite(t, replayBin, srcDir, dst, "t")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		got := dliteRows(t, dst, "t", "id")
+		if !equalLines([]string{"1|hi", "2|world"}, got) {
+			t.Errorf("rows = %v\nreplay:\n%s", got, out)
+		}
+	})
+
+	t.Run("dolt_to_dolt", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dstDir := freshDoltDir(t)
+		out, err := runReplayDoltToDolt(t, replayBin, srcDir, dstDir, "t")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		got := doltRows(t, dstDir, "t", "id")
+		if !equalLines([]string{"1|hi", "2|world"}, got) {
+			t.Errorf("rows = %v\nreplay:\n%s", got, out)
+		}
+	})
 }
 
 // TestReplaySchema_DoltSrc_RenameColumn: dolt-source ALTER RENAME
