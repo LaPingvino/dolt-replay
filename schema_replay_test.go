@@ -408,13 +408,6 @@ SELECT dolt_commit('-Am','drop and add');`)
 // whether the rename surfaces correctly through the diff layer and
 // applies on the target.
 func TestReplaySchema_RenameColumn(t *testing.T) {
-	t.Skip("partial: rename detection lands the ALTER ... RENAME COLUMN now, " +
-		"but seed-leg INSERTs still lose the renamed column's data because " +
-		"dolt_diff_<table>'s header is HEAD-aligned (e.g. has `to_label` not " +
-		"`to_name`). Filtering the value columns by schema-at-child name drops " +
-		"the renamed column. Fix needs name-translation across the rename " +
-		"history (forward-walk renames) or positional mapping in the row reader.")
-
 	runBothDirections(t, "t", "id", []string{"1|alpha", "2|beta"},
 		func(t *testing.T, src string) {
 			dliteSQLcheck(t, src, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);

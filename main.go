@@ -687,18 +687,44 @@ func doltliteDiffSQL(db, parent, child, table string) (string, error) {
 		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 	}
 
-	// Filter cols to those that actually appear in the dolt_diff_<table>
-	// header. dolt_diff_<table>'s schema is HEAD-aligned, so columns
-	// that were dropped before HEAD won't have to_<col>/from_<col>
-	// fields. Without this filter, idx() returns -1 for those and we
-	// panic on r[-1]. The filter trades off intermediate-state fidelity
-	// for final-state correctness — the dropped column's values aren't
-	// recoverable from dolt_diff anyway, and the target's final schema
-	// (which doesn't have the column either) ends up correct.
-	var diffCols []string
-	for _, c := range cols {
-		if idx("to_"+c) >= 0 || idx("from_"+c) >= 0 {
-			diffCols = append(diffCols, c)
+	// Map schema-at-child column names to dolt_diff_<table> header
+	// to_X/from_X fields. Direct lookup by name covers the common case;
+	// when a column has been renamed before HEAD, the header carries
+	// the post-rename name, so direct lookup misses. Fall back to
+	// positional matching against pragma_table_info(<table>) at HEAD —
+	// schema-at-child[i] aligns with HEAD-col[i] when the same number
+	// of columns (renames preserve position; ADD/DROP would shift, but
+	// ADDs are tracked separately via schemaSQL ALTER ADD and DROPs
+	// pair with column removal).
+	headIdx := func(name string) (int, int) { return idx("to_" + name), idx("from_" + name) }
+
+	// Pragma at HEAD; used only when direct name lookup fails.
+	var headCols []string
+	pOut, _, perr := run("", "", "doltlite", "-csv", "-header", db,
+		fmt.Sprintf("SELECT name FROM pragma_table_info('%s')", table))
+	if perr == nil {
+		pcr := csv.NewReader(strings.NewReader(pOut))
+		prows, _ := pcr.ReadAll()
+		for i, r := range prows {
+			if i == 0 || len(r) == 0 {
+				continue
+			}
+			headCols = append(headCols, strings.TrimSpace(r[0]))
+		}
+	}
+
+	type colSlot struct {
+		name        string // emit name (schema-at-child)
+		toIx, frIx  int
+	}
+	var slots []colSlot
+	for i, c := range cols {
+		ti, fi := headIdx(c)
+		if ti < 0 && fi < 0 && i < len(headCols) {
+			ti, fi = headIdx(headCols[i])
+		}
+		if ti >= 0 || fi >= 0 {
+			slots = append(slots, colSlot{name: c, toIx: ti, frIx: fi})
 		}
 	}
 
@@ -707,15 +733,14 @@ func doltliteDiffSQL(db, parent, child, table string) (string, error) {
 		op := r[dtIdx]
 		switch op {
 		case "added":
-			vs := make([]string, 0, len(diffCols))
-			cs := make([]string, 0, len(diffCols))
-			for _, c := range diffCols {
-				ti := idx("to_" + c)
-				if ti < 0 {
+			vs := make([]string, 0, len(slots))
+			cs := make([]string, 0, len(slots))
+			for _, s := range slots {
+				if s.toIx < 0 {
 					continue
 				}
-				vs = append(vs, q(r[ti]))
-				cs = append(cs, `"`+c+`"`)
+				vs = append(vs, q(r[s.toIx]))
+				cs = append(cs, `"`+s.name+`"`)
 			}
 			if len(cs) > 0 {
 				fmt.Fprintf(&sb, "INSERT INTO \"%s\" (%s) VALUES (%s);\n",
@@ -723,13 +748,12 @@ func doltliteDiffSQL(db, parent, child, table string) (string, error) {
 			}
 		case "removed":
 			parts := []string{}
-			for _, c := range diffCols {
-				fi := idx("from_" + c)
-				if fi < 0 {
+			for _, s := range slots {
+				if s.frIx < 0 {
 					continue
 				}
-				if v := r[fi]; v != "" {
-					parts = append(parts, fmt.Sprintf(`"%s"=%s`, c, q(v)))
+				if v := r[s.frIx]; v != "" {
+					parts = append(parts, fmt.Sprintf(`"%s"=%s`, s.name, q(v)))
 				}
 			}
 			if len(parts) > 0 {
@@ -738,15 +762,13 @@ func doltliteDiffSQL(db, parent, child, table string) (string, error) {
 		case "modified":
 			sets := []string{}
 			where := []string{}
-			for _, c := range diffCols {
-				ti := idx("to_" + c)
-				fi := idx("from_" + c)
-				if ti >= 0 {
-					sets = append(sets, fmt.Sprintf(`"%s"=%s`, c, q(r[ti])))
+			for _, s := range slots {
+				if s.toIx >= 0 {
+					sets = append(sets, fmt.Sprintf(`"%s"=%s`, s.name, q(r[s.toIx])))
 				}
-				if fi >= 0 {
-					if v := r[fi]; v != "" {
-						where = append(where, fmt.Sprintf(`"%s"=%s`, c, q(v)))
+				if s.frIx >= 0 {
+					if v := r[s.frIx]; v != "" {
+						where = append(where, fmt.Sprintf(`"%s"=%s`, s.name, q(v)))
 					}
 				}
 			}

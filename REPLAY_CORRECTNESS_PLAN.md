@@ -19,7 +19,7 @@ Each row is a case category. Each column is a (src-kind, dst-kind) pair. Cell va
 | AddWithDefault (case 1)     | ⏭ | ⏭ | ⏭ | ⏭ |
 | DropThenAdd (case 2)        | ⏭ | ⏭ | ⏭ | ⏭ |
 | DropOnly                    | ✅ | ✅ | ✅ | ✅ |
-| RenameColumn                | ⏭ | ⏭ | ✅ | ✅ |
+| RenameColumn                | ✅ | ✅ | ✅ | ✅ |
 | TypeWidening                | ⏭ | ⏭ | ✅ | ✅ |
 | TypeNarrowing (overflow)    | ⏭ | ⏭ | ✅ | ✅ |
 | DropTable                   | ✅ | ✅ | ✅ | ✅ |
@@ -37,9 +37,9 @@ Update this table after each loop tick.
 
 3. **doltliteLog date-sort** (main.go around line 197): doltlite doesn't expose `dolt_commit_ancestors` yet, so the log walker sorts by date with second-resolution timestamps. Commits inside the same second shuffle, breaking parent inference. Workaround in the test suite: `dliteCommitSep(t)` sleeps 1.1s between commits. Real fix: use a parent-aware traversal.
 
-4. **RenameColumn (dlite-source)**: Two layers, partially fixed:
-   - **Schema layer (fixed)**: `dolt_schema_diff` does return from/to CREATE TABLE statements correctly for renames on doltlite v0.9.3 (earlier `unknown operation` symptom was query-shape-dependent). `deriveAlterFromCreate` now detects rename via single-drop+single-add at matching position with matching def, and emits `ALTER TABLE ... RENAME COLUMN`. The schema-only path also no longer discards the schema SQL when data-diff is empty.
-   - **Data layer (still broken)**: For the seed commit before a later rename, `dolt_diff_<table>` is HEAD-aligned — its header has `to_label`/`from_label` (post-rename name), not `to_name`/`from_name` (the name at seed-time). The diffCols filter drops the renamed column, so seed-leg INSERTs become `INSERT INTO t (id) VALUES (1), (2)` and the data is lost. Fix needs forward-walk of renames to translate schema-at-child column names to current dolt_diff header names, or positional mapping in the row reader. Multi-tick.
+4. **RenameColumn (dlite-source)**: Now fully green. Two-part fix:
+   - **Schema layer**: `deriveAlterFromCreate` detects single-rename (one column dropped + one added at same position with matching def) and emits `ALTER TABLE ... RENAME COLUMN`.
+   - **Data layer**: When `dolt_diff_<table>`'s HEAD-aligned header has no `to_<schema-at-child-col>` field (because the column was renamed before HEAD), fall back to positional mapping against `pragma_table_info` at HEAD — schema-at-child[i] aligns with HEAD-col[i].
 
 5. **dolt-source path silently drops data** on schema-change commits — same upstream bug as 1+2 viewed from the source side. `dolt diff -r sql` is what we use; it emits only the ALTER, never the data. Until the upstream fix lands, dolt→* tests will fail on schema-change commits unless we work around it ourselves.
 
