@@ -281,30 +281,23 @@ func doltliteSchemaChangeSQL(db, parent, child, table string) (string, error) {
 		parent, child, table)
 	out, errs, err := run("", "", "doltlite", "-csv", "-header", db, q)
 	if err != nil {
-		// doltlite's dolt_schema_diff errors with `unknown operation` on
-		// pure-rename commits (and possibly other change shapes it doesn't
-		// emit directly). Fall back to fetching the to_create_statement at
-		// parent and at child via root-anchored diffs and compute the diff
-		// client-side.
+		// doltlite v0.9.3's dolt_schema_diff errors with `unknown operation`
+		// on change shapes it doesn't emit (e.g. DROP TABLE between two
+		// commits). For a DROP, the table won't exist at HEAD — pragma_
+		// table_info returns no rows. Use that signal to emit DROP TABLE.
 		if strings.Contains(errs, "unknown operation") {
-			fromSQL, ferr := doltliteCreateAtCommit(db, parent, table)
-			if ferr != nil {
-				return "", ferr
+			pOut, _, perr := run("", "", "doltlite", "-csv", "-header", db,
+				fmt.Sprintf("SELECT name FROM pragma_table_info('%s')", table))
+			if perr == nil {
+				pcr := csv.NewReader(strings.NewReader(pOut))
+				prows, _ := pcr.ReadAll()
+				if len(prows) < 2 {
+					return fmt.Sprintf("DROP TABLE \"%s\";\n", table), nil
+				}
 			}
-			toSQL, terr := doltliteCreateAtCommit(db, child, table)
-			if terr != nil {
-				return "", terr
-			}
-			if fromSQL == toSQL {
-				return "", nil
-			}
-			if fromSQL == "" && toSQL != "" {
-				return toSQL + ";\n", nil
-			}
-			if toSQL == "" && fromSQL != "" {
-				return fmt.Sprintf("DROP TABLE \"%s\";\n", table), nil
-			}
-			return deriveAlterFromCreate(table, fromSQL, toSQL), nil
+			// Other unhandled change shape — surface no schema SQL and let
+			// the data layer attempt to apply what it can.
+			return "", nil
 		}
 		return "", err
 	}
@@ -619,6 +612,12 @@ func doltliteDiffSQL(db, parent, child, table string) (string, error) {
 	schemaSQL, err := doltliteSchemaChangeSQL(db, parent, child, table)
 	if err != nil {
 		return "", err
+	}
+
+	// If the schema layer emitted DROP TABLE, the table is gone at child;
+	// no data-layer work makes sense (and dolt_diff_<table> will fail).
+	if strings.HasPrefix(strings.TrimSpace(schemaSQL), "DROP TABLE") {
+		return schemaSQL, nil
 	}
 
 	// Determine the to-schema column list AT THIS COMMIT, not the
