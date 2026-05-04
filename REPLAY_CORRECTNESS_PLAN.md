@@ -25,7 +25,7 @@ Each row is a case category. Each column is a (src-kind, dst-kind) pair. Cell va
 | DropTable                   | ✅ | ✅ | — | — |
 | CreateTableMidHistory       | ✅ | ✅ | — | — |
 | MultiTable                  | ✅ | ✅ | — | — |
-| RowOrderingPreserved        | — | — | — | — |
+| RowOrderingPreserved        | ✅ | ✅ | — | — |
 
 Update this table after each loop tick.
 

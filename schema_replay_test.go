@@ -424,6 +424,22 @@ SELECT dolt_commit('-Am','rename');`)
 		})
 }
 
+// TestReplaySchema_RowOrderingPreserved: insert rows in non-PK-sorted
+// order across multiple commits, verify the target's PK-ordered read
+// matches the source's. Catches any sneaky reordering or row aliasing.
+func TestReplaySchema_RowOrderingPreserved(t *testing.T) {
+	runBothDirections(t, "t", "id",
+		[]string{"1|alpha", "2|beta", "3|gamma", "4|delta", "5|epsilon"},
+		func(t *testing.T, src string) {
+			dliteSQLcheck(t, src, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t VALUES (3,'gamma'),(1,'alpha'),(5,'epsilon');
+SELECT dolt_commit('-Am','seed out-of-order');`)
+			dliteCommitSep(t)
+			dliteSQLcheck(t, src, `INSERT INTO t VALUES (4,'delta'),(2,'beta');
+SELECT dolt_commit('-Am','add interior rows');`)
+		})
+}
+
 // TestReplaySchema_CreateTableMidHistory: a table introduced not in the
 // initial seed but in a later commit. Tests that the schema-and-data
 // emitter handles tables whose first appearance is partway through.
