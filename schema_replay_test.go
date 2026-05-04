@@ -424,6 +424,70 @@ SELECT dolt_commit('-Am','rename');`)
 		})
 }
 
+// TestReplaySchema_CreateTableMidHistory: a table introduced not in the
+// initial seed but in a later commit. Tests that the schema-and-data
+// emitter handles tables whose first appearance is partway through.
+func TestReplaySchema_CreateTableMidHistory(t *testing.T) {
+	setup := func(t *testing.T, src string) {
+		dliteSQLcheck(t, src, `CREATE TABLE a(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO a VALUES (1,'x');
+SELECT dolt_commit('-Am','seed a');`)
+		dliteCommitSep(t)
+		dliteSQLcheck(t, src, `CREATE TABLE b(id INTEGER PRIMARY KEY, val INTEGER);
+INSERT INTO b VALUES (10, 100);
+SELECT dolt_commit('-Am','add b');`)
+		dliteCommitSep(t)
+		dliteSQLcheck(t, src, `INSERT INTO a VALUES (2,'y');
+INSERT INTO b VALUES (20, 200);
+SELECT dolt_commit('-Am','data both');`)
+	}
+
+	check := func(t *testing.T, readA, readB func() []string) {
+		gotA := readA()
+		wantA := []string{"1|x", "2|y"}
+		if !equalLines(wantA, gotA) {
+			t.Errorf("table a rows = %v, want %v", gotA, wantA)
+		}
+		gotB := readB()
+		wantB := []string{"10|100", "20|200"}
+		if !equalLines(wantB, gotB) {
+			t.Errorf("table b rows = %v, want %v", gotB, wantB)
+		}
+	}
+
+	t.Run("dlite_to_dlite", func(t *testing.T) {
+		replayBin := requireDoltliteOnly(t)
+		src := freshDoltliteSrc(t, "src.dl")
+		setup(t, src)
+
+		dst := filepath.Join(filepath.Dir(src), "dst.dl")
+		out, err := runReplayDoltliteToDoltlite(t, replayBin, src, dst, "")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		check(t,
+			func() []string { return dliteRows(t, dst, "a", "id") },
+			func() []string { return dliteRows(t, dst, "b", "id") },
+		)
+	})
+
+	t.Run("dlite_to_dolt", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		src := freshDoltliteSrc(t, "src.dl")
+		setup(t, src)
+
+		dstDir := freshDoltDir(t)
+		out, err := runReplayDoltliteToDolt(t, replayBin, src, dstDir, "")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		check(t,
+			func() []string { return doltRows(t, dstDir, "a", "id") },
+			func() []string { return doltRows(t, dstDir, "b", "id") },
+		)
+	})
+}
+
 // TestReplaySchema_MultiTable: two tables change in the same history.
 // Replay with --table="" (all tables) and verify both end states.
 func TestReplaySchema_MultiTable(t *testing.T) {
