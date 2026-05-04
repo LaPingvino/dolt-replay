@@ -694,6 +694,54 @@ CALL DOLT_COMMIT('-Am','drop and add');`)
 		})
 }
 
+// TestReplaySchema_DoltSrc_TypeWidening: dolt-source MODIFY COLUMN to
+// widen the type. Dolt supports MODIFY COLUMN natively, so the source
+// commit can be set up. The replay then either preserves the widened
+// type, or — if dialect translation strips type info — the doltlite
+// target ends up with the values intact (TEXT-coerced) and the dolt
+// target with the widened type.
+func TestReplaySchema_DoltSrc_TypeWidening(t *testing.T) {
+	setup := func(t *testing.T, srcDir string) {
+		doltSQLcheck(t, srcDir, `CREATE TABLE t(id INTEGER PRIMARY KEY, name VARCHAR(10));
+INSERT INTO t VALUES (1,'hello'),(2,'world');
+CALL DOLT_COMMIT('-Am','seed');`)
+		doltSQLcheck(t, srcDir, `ALTER TABLE t MODIFY COLUMN name VARCHAR(50);
+CALL DOLT_COMMIT('-Am','widen');`)
+	}
+
+	t.Run("dolt_to_dlite", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dst := filepath.Join(t.TempDir(), "dst.dl")
+		out, err := runReplayDoltToDoltlite(t, replayBin, srcDir, dst, "t")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		got := dliteRows(t, dst, "t", "id")
+		if !equalLines([]string{"1|hello", "2|world"}, got) {
+			t.Errorf("rows = %v\nreplay:\n%s", got, out)
+		}
+	})
+
+	t.Run("dolt_to_dolt", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		srcDir := freshDoltDir(t)
+		setup(t, srcDir)
+
+		dstDir := freshDoltDir(t)
+		out, err := runReplayDoltToDolt(t, replayBin, srcDir, dstDir, "t")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		got := doltRows(t, dstDir, "t", "id")
+		if !equalLines([]string{"1|hello", "2|world"}, got) {
+			t.Errorf("rows = %v\nreplay:\n%s", got, out)
+		}
+	})
+}
+
 // TestReplaySchema_DoltSrc_DropTable: dolt-source DROP TABLE on a
 // previously-populated table. Pure-schema in the drop commit; no
 // upstream silent-skip hit.
