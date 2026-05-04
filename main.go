@@ -512,34 +512,67 @@ func doltliteDiffSQL(db, parent, child, table string) (string, error) {
 		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 	}
 
+	// Filter cols to those that actually appear in the dolt_diff_<table>
+	// header. dolt_diff_<table>'s schema is HEAD-aligned, so columns
+	// that were dropped before HEAD won't have to_<col>/from_<col>
+	// fields. Without this filter, idx() returns -1 for those and we
+	// panic on r[-1]. The filter trades off intermediate-state fidelity
+	// for final-state correctness — the dropped column's values aren't
+	// recoverable from dolt_diff anyway, and the target's final schema
+	// (which doesn't have the column either) ends up correct.
+	var diffCols []string
+	for _, c := range cols {
+		if idx("to_"+c) >= 0 || idx("from_"+c) >= 0 {
+			diffCols = append(diffCols, c)
+		}
+	}
+
 	var sb strings.Builder
 	for _, r := range drows[1:] {
 		op := r[dtIdx]
 		switch op {
 		case "added":
-			vs := make([]string, len(cols))
-			cs := make([]string, len(cols))
-			for i, c := range cols {
-				vs[i] = q(r[idx("to_"+c)])
-				cs[i] = `"` + c + `"`
+			vs := make([]string, 0, len(diffCols))
+			cs := make([]string, 0, len(diffCols))
+			for _, c := range diffCols {
+				ti := idx("to_" + c)
+				if ti < 0 {
+					continue
+				}
+				vs = append(vs, q(r[ti]))
+				cs = append(cs, `"`+c+`"`)
 			}
-			fmt.Fprintf(&sb, "INSERT INTO \"%s\" (%s) VALUES (%s);\n",
-				table, strings.Join(cs, ","), strings.Join(vs, ","))
+			if len(cs) > 0 {
+				fmt.Fprintf(&sb, "INSERT INTO \"%s\" (%s) VALUES (%s);\n",
+					table, strings.Join(cs, ","), strings.Join(vs, ","))
+			}
 		case "removed":
 			parts := []string{}
-			for _, c := range cols {
-				if v := r[idx("from_"+c)]; v != "" {
+			for _, c := range diffCols {
+				fi := idx("from_" + c)
+				if fi < 0 {
+					continue
+				}
+				if v := r[fi]; v != "" {
 					parts = append(parts, fmt.Sprintf(`"%s"=%s`, c, q(v)))
 				}
 			}
-			fmt.Fprintf(&sb, "DELETE FROM \"%s\" WHERE %s;\n", table, strings.Join(parts, " AND "))
+			if len(parts) > 0 {
+				fmt.Fprintf(&sb, "DELETE FROM \"%s\" WHERE %s;\n", table, strings.Join(parts, " AND "))
+			}
 		case "modified":
 			sets := []string{}
 			where := []string{}
-			for _, c := range cols {
-				sets = append(sets, fmt.Sprintf(`"%s"=%s`, c, q(r[idx("to_"+c)])))
-				if v := r[idx("from_"+c)]; v != "" {
-					where = append(where, fmt.Sprintf(`"%s"=%s`, c, q(v)))
+			for _, c := range diffCols {
+				ti := idx("to_" + c)
+				fi := idx("from_" + c)
+				if ti >= 0 {
+					sets = append(sets, fmt.Sprintf(`"%s"=%s`, c, q(r[ti])))
+				}
+				if fi >= 0 {
+					if v := r[fi]; v != "" {
+						where = append(where, fmt.Sprintf(`"%s"=%s`, c, q(v)))
+					}
 				}
 			}
 			fmt.Fprintf(&sb, "UPDATE \"%s\" SET %s WHERE %s;\n",
@@ -864,6 +897,28 @@ func translateForDolt(sql string) string {
 
 // ---------- target writers ----------
 
+// normalizeDateForDolt converts a date string in any of the formats our
+// source backends emit (doltlite "YYYY-MM-DD HH:MM:SS", dolt CSV
+// "YYYY-MM-DD HH:MM:SS.sss +0000 UTC", RFC3339, etc.) to the RFC3339
+// form `dolt commit --date` accepts. Returns the input unchanged if no
+// known format matches — `dolt commit` will then error with its own
+// message, which is more useful than a silent drop.
+func normalizeDateForDolt(s string) string {
+	formats := []string{
+		time.RFC3339,
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.000",
+		"2006-01-02 15:04:05 -0700 MST",
+		"2006-01-02T15:04:05",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t.UTC().Format(time.RFC3339)
+		}
+	}
+	return s
+}
+
 func applyToDolt(repo, sql, msg, author, email, date string) error {
 	full := "SET FOREIGN_KEY_CHECKS=0;\n" + sql + "\nSET FOREIGN_KEY_CHECKS=1;\n"
 	if _, errs, err := run(repo, full, "dolt", "sql"); err != nil {
@@ -872,9 +927,15 @@ func applyToDolt(repo, sql, msg, author, email, date string) error {
 	if _, _, err := run(repo, "", "dolt", "add", "-A"); err != nil {
 		return err
 	}
-	out, errs, err := run(repo, "", "dolt", "commit", "-m", msg,
-		"--author", fmt.Sprintf("%s <%s>", author, email),
-		"--date", date)
+	args := []string{"commit", "-m", msg, "--date", normalizeDateForDolt(date)}
+	// --author with an empty email part fails dolt's validation; only
+	// pass it through when both fields are present. Otherwise dolt
+	// falls back to the user.name / user.email config, which is fine
+	// for replay targets the test or operator controls.
+	if author != "" && email != "" {
+		args = append(args, "--author", fmt.Sprintf("%s <%s>", author, email))
+	}
+	out, errs, err := run(repo, "", "dolt", args...)
 	if err != nil && !strings.Contains(out+errs, "nothing to commit") {
 		return fmt.Errorf("dolt commit: %v\n%s", err, errs)
 	}
