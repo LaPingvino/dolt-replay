@@ -419,6 +419,42 @@ SELECT dolt_commit('-Am','drop column');`)
 		})
 }
 
+// TestReplaySchema_DoltSrc_AddWithDefault: dolt-source side of nicktobey
+// case 1. Compounds two failure modes:
+//   - upstream #10988 silent-skip on schema-change commits (source-side)
+//   - dolt_diff_<table> not surfacing ALTER's default-population (algorithm)
+// Skipped pending the schema-then-diff-against-rebased-baseline fix.
+func TestReplaySchema_DoltSrc_AddWithDefault(t *testing.T) {
+	t.Skip("known gap: dolt-source path + nicktobey case 1 — see dolthub/dolt#10988")
+
+	runBothDirectionsFromDolt(t, "t", "pk", []string{"0|6", "1|6", "2|6"},
+		func(t *testing.T, srcDir string) {
+			doltSQLcheck(t, srcDir, `CREATE TABLE t(pk INTEGER PRIMARY KEY);
+INSERT INTO t VALUES (0),(1),(2);
+CALL DOLT_COMMIT('-Am','seed');`)
+			doltSQLcheck(t, srcDir, `ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 6;
+CALL DOLT_COMMIT('-Am','add column with default');`)
+		})
+}
+
+// TestReplaySchema_DoltSrc_DropThenAdd: dolt-source side of nicktobey
+// case 2. Same cascade — upstream silent-skip plus positional row-record
+// aliasing. Skipped pending the algorithm fix.
+func TestReplaySchema_DoltSrc_DropThenAdd(t *testing.T) {
+	t.Skip("known gap: dolt-source path + nicktobey case 2 — see dolthub/dolt#10988")
+
+	runBothDirectionsFromDolt(t, "t", "pk", []string{"0|10"},
+		func(t *testing.T, srcDir string) {
+			doltSQLcheck(t, srcDir, `CREATE TABLE t(pk INTEGER PRIMARY KEY, a INTEGER);
+INSERT INTO t VALUES (0, 10);
+CALL DOLT_COMMIT('-Am','seed');`)
+			doltSQLcheck(t, srcDir, `ALTER TABLE t DROP COLUMN a;
+ALTER TABLE t ADD COLUMN b INTEGER;
+UPDATE t SET b=10;
+CALL DOLT_COMMIT('-Am','drop and add');`)
+		})
+}
+
 // TestReplaySchema_DoltSrc_DropOnly: dolt-source DROP COLUMN with no
 // accompanying data changes. Pure-schema commits should be safe even
 // under the upstream silent-skip bug since there's no data DML to drop.
