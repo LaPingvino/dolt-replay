@@ -328,6 +328,26 @@ CALL DOLT_COMMIT('-Am','add+remove');`)
 		})
 }
 
+// TestReplaySchema_DoltSrc_AddNullable: dolt-source ADD COLUMN (no
+// default) + data changes in the same commit. From the dolt side this
+// hits the upstream #10988 bug — `dolt diff -r sql` emits the ALTER
+// but silently drops the data DML, so the target ends up with the new
+// schema but missing the row updates. Documents the source-side gap.
+func TestReplaySchema_DoltSrc_AddNullable(t *testing.T) {
+	t.Skip("known gap: dolt-source `dolt diff -r sql` silently drops data on schema-change commits — see dolthub/dolt#10988. Reproduced: combined commit emits only the ALTER (35 bytes), target ends with new schema but missing row updates.")
+
+	runBothDirectionsFromDolt(t, "t", "id", []string{"1|a|", "2|b|", "6|f|", "7|g|"},
+		func(t *testing.T, srcDir string) {
+			doltSQLcheck(t, srcDir, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+CALL DOLT_COMMIT('-Am','seed');`)
+			doltSQLcheck(t, srcDir, `ALTER TABLE t ADD COLUMN extra TEXT;
+DELETE FROM t WHERE id IN (3,4,5);
+INSERT INTO t VALUES (6,'f',NULL),(7,'g',NULL);
+CALL DOLT_COMMIT('-Am','combined');`)
+		})
+}
+
 // TestReplaySchema_AddNullable: ADD COLUMN with no default plus data
 // changes in the same commit — the bahaiwritings shape, the case the
 // prototype was specifically built for.
