@@ -233,13 +233,79 @@ func doltliteLog(db string, limit int) ([]Commit, error) {
 // CREATE TABLE statements) and `dolt_diff_<table>` (per-row data delta)
 // as system tables, which is the cleaner shape — we just need to use
 // them together.
+// doltliteCreateAtCommit fetches the to_create_statement of the table
+// at the given commit by querying dolt_schema_diff anchored on the
+// repo's root commit. Returns "" when the table doesn't exist there.
+// Used as a fallback when a pair-anchored dolt_schema_diff returns
+// `unknown operation`.
+func doltliteCreateAtCommit(db, commit, table string) (string, error) {
+	// Pin to the auto-init commit by message. `ORDER BY date LIMIT 1`
+	// is unreliable here because doltlite's dates are second-resolution
+	// and the user's first dolt_commit can land in the same second as
+	// the auto-init, shuffling the sort and returning the wrong root.
+	rootOut, _, err := run("", "", "doltlite", "-csv", "-header", db,
+		"SELECT commit_hash FROM dolt_log WHERE message='Initialize data repository' ORDER BY date LIMIT 1")
+	if err != nil {
+		return "", err
+	}
+	cr := csv.NewReader(strings.NewReader(rootOut))
+	rrows, _ := cr.ReadAll()
+	if len(rrows) < 2 {
+		return "", nil
+	}
+	root := strings.TrimSpace(rrows[1][0])
+	if root == commit {
+		return "", nil
+	}
+	q := fmt.Sprintf(
+		"SELECT to_create_statement FROM dolt_schema_diff "+
+			"WHERE from_ref='%s' AND to_ref='%s' AND table_name='%s'",
+		root, commit, table)
+	out, _, err := run("", "", "doltlite", "-csv", "-header", db, q)
+	if err != nil {
+		return "", err
+	}
+	cr2 := csv.NewReader(strings.NewReader(out))
+	cr2.FieldsPerRecord = -1
+	rows, _ := cr2.ReadAll()
+	if len(rows) < 2 {
+		return "", nil
+	}
+	return strings.TrimSpace(rows[1][0]), nil
+}
+
 func doltliteSchemaChangeSQL(db, parent, child, table string) (string, error) {
 	q := fmt.Sprintf(
 		"SELECT from_create_statement, to_create_statement FROM dolt_schema_diff "+
 			"WHERE from_ref='%s' AND to_ref='%s' AND table_name='%s'",
 		parent, child, table)
-	out, _, err := run("", "", "doltlite", "-csv", "-header", db, q)
+	out, errs, err := run("", "", "doltlite", "-csv", "-header", db, q)
 	if err != nil {
+		// doltlite's dolt_schema_diff errors with `unknown operation` on
+		// pure-rename commits (and possibly other change shapes it doesn't
+		// emit directly). Fall back to fetching the to_create_statement at
+		// parent and at child via root-anchored diffs and compute the diff
+		// client-side.
+		if strings.Contains(errs, "unknown operation") {
+			fromSQL, ferr := doltliteCreateAtCommit(db, parent, table)
+			if ferr != nil {
+				return "", ferr
+			}
+			toSQL, terr := doltliteCreateAtCommit(db, child, table)
+			if terr != nil {
+				return "", terr
+			}
+			if fromSQL == toSQL {
+				return "", nil
+			}
+			if fromSQL == "" && toSQL != "" {
+				return toSQL + ";\n", nil
+			}
+			if toSQL == "" && fromSQL != "" {
+				return fmt.Sprintf("DROP TABLE \"%s\";\n", table), nil
+			}
+			return deriveAlterFromCreate(table, fromSQL, toSQL), nil
+		}
 		return "", err
 	}
 	cr := csv.NewReader(strings.NewReader(out))
@@ -359,12 +425,63 @@ func deriveAlterFromCreate(table, fromSQL, toSQL string) string {
 
 	var sb strings.Builder
 
+	// Rename detection: collect set-difference both ways. When exactly
+	// one column is missing-from-to and exactly one is missing-from-from
+	// AND they sit in the same ordinal position with matching defs, emit
+	// RENAME instead of DROP+ADD (which would lose data).
+	var droppedNames, addedNames []string
 	for _, fc := range fromCols {
+		if findCol(toCols, fc.name) == nil {
+			droppedNames = append(droppedNames, fc.name)
+		}
+	}
+	for _, tc := range toCols {
+		if findCol(fromCols, tc.name) == nil {
+			addedNames = append(addedNames, tc.name)
+		}
+	}
+	renames := map[string]string{} // old → new
+	if len(droppedNames) == 1 && len(addedNames) == 1 {
+		oldName, newName := droppedNames[0], addedNames[0]
+		var oldIdx, newIdx int = -1, -1
+		for i, c := range fromCols {
+			if c.name == oldName {
+				oldIdx = i
+				break
+			}
+		}
+		for i, c := range toCols {
+			if c.name == newName {
+				newIdx = i
+				break
+			}
+		}
+		if oldIdx >= 0 && oldIdx == newIdx && fromCols[oldIdx].def == toCols[newIdx].def {
+			fmt.Fprintf(&sb, "ALTER TABLE \"%s\" RENAME COLUMN \"%s\" TO \"%s\";\n",
+				table, oldName, newName)
+			renames[oldName] = newName
+		}
+	}
+
+	for _, fc := range fromCols {
+		if _, isRenamed := renames[fc.name]; isRenamed {
+			continue
+		}
 		if findCol(toCols, fc.name) == nil {
 			fmt.Fprintf(&sb, "ALTER TABLE \"%s\" DROP COLUMN \"%s\";\n", table, fc.name)
 		}
 	}
 	for _, tc := range toCols {
+		isRenameTarget := false
+		for _, newName := range renames {
+			if newName == tc.name {
+				isRenameTarget = true
+				break
+			}
+		}
+		if isRenameTarget {
+			continue
+		}
 		if findCol(fromCols, tc.name) == nil {
 			fmt.Fprintf(&sb, "ALTER TABLE \"%s\" ADD COLUMN \"%s\" %s;\n", table, tc.name, tc.def)
 		}
@@ -409,8 +526,12 @@ func doltliteToSchemaCols(db, parent, child, table string) ([]string, error) {
 	// Schema unchanged in (parent, child). Diff against root commit to
 	// recover the schema at child. dolt_log ORDER BY date LIMIT 1 returns
 	// the chronologically-first commit (the auto Initialize).
+	// Pin to the auto-init commit by message. `ORDER BY date LIMIT 1`
+	// is unreliable here because doltlite's dates are second-resolution
+	// and the user's first dolt_commit can land in the same second as
+	// the auto-init, shuffling the sort and returning the wrong root.
 	rootOut, _, err := run("", "", "doltlite", "-csv", "-header", db,
-		"SELECT commit_hash FROM dolt_log ORDER BY date LIMIT 1")
+		"SELECT commit_hash FROM dolt_log WHERE message='Initialize data repository' ORDER BY date LIMIT 1")
 	if err != nil {
 		return nil, err
 	}
@@ -538,13 +659,17 @@ func doltliteDiffSQL(db, parent, child, table string) (string, error) {
 	dq := fmt.Sprintf("SELECT * FROM dolt_diff_%s WHERE to_commit='%s' AND from_commit='%s'", table, child, parent)
 	dOut, _, err := run("", "", "doltlite", "-csv", "-header", db, dq)
 	if err != nil {
-		return "", nil
+		// Data-diff probe failed (e.g. dolt_diff_<table> doesn't exist
+		// for a schema-only change at this point). The schema portion is
+		// still valid; emit it without the data.
+		return schemaSQL, nil
 	}
 	dr := csv.NewReader(strings.NewReader(dOut))
 	dr.FieldsPerRecord = -1
 	drows, _ := dr.ReadAll()
 	if len(drows) < 2 {
-		return "", nil
+		// No data rows changed; just emit the schema SQL.
+		return schemaSQL, nil
 	}
 	hdr := drows[0]
 	idx := func(n string) int {

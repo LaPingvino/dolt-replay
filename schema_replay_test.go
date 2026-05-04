@@ -408,10 +408,12 @@ SELECT dolt_commit('-Am','drop and add');`)
 // whether the rename surfaces correctly through the diff layer and
 // applies on the target.
 func TestReplaySchema_RenameColumn(t *testing.T) {
-	t.Skip("known gap: doltlite dolt_schema_diff errors with `unknown operation` for pure-rename commits (probed 2026-05-04 against system doltlite). " +
-		"Doltlite itself does rename the column correctly (pragma_table_info confirms); the gap is in the system-table emit. " +
-		"Workaround options: (a) fall back to comparing root→parent vs root→child to_create_statements client-side when dolt_schema_diff errors; " +
-		"(b) report upstream and wait. The seed-leg empty-values symptom is downstream of the same `unknown operation` error returned during seed-time schema fetch.")
+	t.Skip("partial: rename detection lands the ALTER ... RENAME COLUMN now, " +
+		"but seed-leg INSERTs still lose the renamed column's data because " +
+		"dolt_diff_<table>'s header is HEAD-aligned (e.g. has `to_label` not " +
+		"`to_name`). Filtering the value columns by schema-at-child name drops " +
+		"the renamed column. Fix needs name-translation across the rename " +
+		"history (forward-walk renames) or positional mapping in the row reader.")
 
 	runBothDirections(t, "t", "id", []string{"1|alpha", "2|beta"},
 		func(t *testing.T, src string) {
