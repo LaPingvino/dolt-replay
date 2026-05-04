@@ -424,6 +424,27 @@ SELECT dolt_commit('-Am','rename');`)
 		})
 }
 
+// TestReplaySchema_TypeWidening: ALTER COLUMN to widen a type
+// (e.g. INTEGER → BIGINT, VARCHAR(10) → VARCHAR(50)). Pure type change,
+// no value loss expected. Tests whether deriveAlterFromCreate detects
+// type changes and emits something usable.
+func TestReplaySchema_TypeWidening(t *testing.T) {
+	t.Skip("setup blocked: doltlite (SQLite) doesn't support `ALTER TABLE ... MODIFY COLUMN`. " +
+		"Type widening from a doltlite source needs either a SQLite table-rebuild pattern " +
+		"(temp table + INSERT SELECT + RENAME) in the test setup, or skip dlite-source " +
+		"type-widening entirely and only test dolt-source where it works natively.")
+
+	runBothDirections(t, "t", "id", []string{"1|hello", "2|world"},
+		func(t *testing.T, src string) {
+			dliteSQLcheck(t, src, `CREATE TABLE t(id INTEGER PRIMARY KEY, name VARCHAR(10));
+INSERT INTO t VALUES (1,'hello'),(2,'world');
+SELECT dolt_commit('-Am','seed');`)
+			dliteCommitSep(t)
+			dliteSQLcheck(t, src, `ALTER TABLE t MODIFY COLUMN name VARCHAR(50);
+SELECT dolt_commit('-Am','widen');`)
+		})
+}
+
 // TestReplaySchema_DropOnly: DROP COLUMN with no add. Existing rows
 // keep their PK + remaining columns; the dropped column simply goes
 // away on the target.
