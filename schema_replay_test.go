@@ -424,6 +424,63 @@ SELECT dolt_commit('-Am','rename');`)
 		})
 }
 
+// TestReplaySchema_DropTable: DROP TABLE on a table that previously
+// had data. Target should end up without the table (or with it gone
+// after the second commit applies). Single-table replay (--table t)
+// means the replay is scoped — what does dropping the watched table
+// actually do?
+func TestReplaySchema_DropTable(t *testing.T) {
+	setup := func(t *testing.T, src string) {
+		dliteSQLcheck(t, src, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t VALUES (1,'a'),(2,'b');
+SELECT dolt_commit('-Am','seed');`)
+		dliteCommitSep(t)
+		dliteSQLcheck(t, src, `DROP TABLE t;
+SELECT dolt_commit('-Am','drop table');`)
+	}
+
+	t.Run("dlite_to_dlite", func(t *testing.T) {
+		replayBin := requireDoltliteOnly(t)
+		src := freshDoltliteSrc(t, "src.dl")
+		setup(t, src)
+
+		dst := filepath.Join(filepath.Dir(src), "dst.dl")
+		out, err := runReplayDoltliteToDoltlite(t, replayBin, src, dst, "t")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		cmd := exec.Command("doltlite", "-csv", "-header", dst,
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='t'")
+		chk, _ := cmd.CombinedOutput()
+		gotLines := strings.Split(strings.TrimSpace(string(chk)), "\n")
+		if len(gotLines) > 1 {
+			t.Errorf("table 't' still exists on doltlite target\nintrospect: %s\nreplay output:\n%s",
+				chk, out)
+		}
+	})
+
+	t.Run("dlite_to_dolt", func(t *testing.T) {
+		replayBin := requireDoltliteAndDolt(t)
+		src := freshDoltliteSrc(t, "src.dl")
+		setup(t, src)
+
+		dstDir := freshDoltDir(t)
+		out, err := runReplayDoltliteToDolt(t, replayBin, src, dstDir, "t")
+		if err != nil {
+			t.Fatalf("replay failed: %v\n%s", err, out)
+		}
+		cmd := exec.Command("dolt", "sql", "-r", "csv", "-q",
+			"SELECT table_name FROM information_schema.tables WHERE table_name='t' AND table_schema=database()")
+		cmd.Dir = dstDir
+		chk, _ := cmd.CombinedOutput()
+		gotLines := strings.Split(strings.TrimSpace(string(chk)), "\n")
+		if len(gotLines) > 1 {
+			t.Errorf("table 't' still exists on dolt target\nintrospect: %s\nreplay output:\n%s",
+				chk, out)
+		}
+	})
+}
+
 // TestReplaySchema_TypeWidening: ALTER COLUMN to widen a type
 // (e.g. INTEGER → BIGINT, VARCHAR(10) → VARCHAR(50)). Pure type change,
 // no value loss expected. Tests whether deriveAlterFromCreate detects

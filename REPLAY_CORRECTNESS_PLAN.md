@@ -22,7 +22,7 @@ Each row is a case category. Each column is a (src-kind, dst-kind) pair. Cell va
 | RenameColumn                | ⏭ | ⏭ | — | — |
 | TypeWidening                | ⏭ | ⏭ | — | — |
 | TypeNarrowing (overflow)    | — | — | — | — |
-| DropTable                   | — | — | — | — |
+| DropTable                   | ✅ | ✅ | — | — |
 | CreateTableMidHistory       | — | — | — | — |
 | MultiTable                  | — | — | — | — |
 | RowOrderingPreserved        | — | — | — | — |
