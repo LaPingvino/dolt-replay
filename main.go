@@ -220,20 +220,268 @@ func doltliteLog(db string, limit int) ([]Commit, error) {
 	return cs, nil
 }
 
-func doltliteDiffSQL(db, parent, child, table string) (string, error) {
-	colsOut, _, err := run("", "", "doltlite", "-csv", "-header", db,
-		fmt.Sprintf("SELECT name FROM pragma_table_info('%s')", table))
+// doltliteSchemaChangeSQL queries dolt_schema_diff for the table between
+// parent and child commits and emits ALTER statements that transform the
+// from-schema into the to-schema. Returns "" if schemas are identical.
+//
+// This is the doltlite-side counterpart to dolthub/dolt#10988 — Dolt's
+// `dolt diff -r sql` silently drops the data diff when schema changed,
+// so any tool that wants a faithful replay of a combined-schema-and-data
+// commit needs to query schema and data separately and assemble the SQL
+// itself. doltlite exposes `dolt_schema_diff` (per-commit-pair from/to
+// CREATE TABLE statements) and `dolt_diff_<table>` (per-row data delta)
+// as system tables, which is the cleaner shape — we just need to use
+// them together.
+func doltliteSchemaChangeSQL(db, parent, child, table string) (string, error) {
+	q := fmt.Sprintf(
+		"SELECT from_create_statement, to_create_statement FROM dolt_schema_diff "+
+			"WHERE from_ref='%s' AND to_ref='%s' AND table_name='%s'",
+		parent, child, table)
+	out, _, err := run("", "", "doltlite", "-csv", "-header", db, q)
 	if err != nil {
 		return "", err
 	}
-	cr := csv.NewReader(strings.NewReader(colsOut))
+	cr := csv.NewReader(strings.NewReader(out))
+	cr.FieldsPerRecord = -1
 	rows, err := cr.ReadAll()
 	if err != nil || len(rows) < 2 {
+		return "", nil
+	}
+	fromSQL := strings.TrimSpace(rows[1][0])
+	toSQL := strings.TrimSpace(rows[1][1])
+	if fromSQL == toSQL {
+		return "", nil
+	}
+	// New table: from is empty, to has the CREATE TABLE — emit it as-is.
+	if fromSQL == "" && toSQL != "" {
+		return toSQL + ";\n", nil
+	}
+	// Dropped table: emit DROP. Data DML for removed rows is irrelevant
+	// once the table is gone, but we keep emitting both for symmetry —
+	// the DROP will run after any DELETEs without complaint.
+	if toSQL == "" && fromSQL != "" {
+		return fmt.Sprintf("DROP TABLE \"%s\";\n", table), nil
+	}
+	return deriveAlterFromCreate(table, fromSQL, toSQL), nil
+}
+
+type colDef struct {
+	name string
+	def  string // type + per-column constraints
+}
+
+// parseCreateTableColumns extracts the column-name + definition pairs
+// from the body of a CREATE TABLE statement. Best-effort: handles
+// `name TYPE [constraints]` for the common case. Skips table-level
+// PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK / INDEX constraints.
+func parseCreateTableColumns(stmt string) []colDef {
+	open := strings.Index(stmt, "(")
+	close := strings.LastIndex(stmt, ")")
+	if open < 0 || close <= open {
+		return nil
+	}
+	body := stmt[open+1 : close]
+
+	var parts []string
+	depth, start := 0, 0
+	for i, r := range body {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, body[start:i])
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, body[start:])
+
+	var cols []colDef
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		upper := strings.ToUpper(p)
+		if strings.HasPrefix(upper, "PRIMARY KEY") ||
+			strings.HasPrefix(upper, "UNIQUE") ||
+			strings.HasPrefix(upper, "FOREIGN KEY") ||
+			strings.HasPrefix(upper, "CHECK") ||
+			strings.HasPrefix(upper, "INDEX") ||
+			strings.HasPrefix(upper, "KEY") ||
+			strings.HasPrefix(upper, "CONSTRAINT") {
+			continue
+		}
+		var name, def string
+		if p[0] == '"' || p[0] == '`' {
+			end := strings.Index(p[1:], string(p[0]))
+			if end < 0 {
+				continue
+			}
+			name = p[1 : 1+end]
+			def = strings.TrimSpace(p[1+end+1:])
+		} else {
+			sp := strings.IndexAny(p, " \t")
+			if sp < 0 {
+				name = p
+			} else {
+				name = p[:sp]
+				def = strings.TrimSpace(p[sp+1:])
+			}
+		}
+		cols = append(cols, colDef{name: name, def: def})
+	}
+	return cols
+}
+
+func findCol(cols []colDef, name string) *colDef {
+	for i, c := range cols {
+		if c.name == name {
+			return &cols[i]
+		}
+	}
+	return nil
+}
+
+// deriveAlterFromCreate emits ALTER TABLE statements that transform the
+// from-schema into the to-schema. Handles the common cases (added /
+// dropped columns) directly; flags type changes with a comment for now
+// — they're representable but require either ALTER COLUMN (engine-
+// dependent) or a temp-table rebuild, which we can add when a real
+// workload needs it.
+func deriveAlterFromCreate(table, fromSQL, toSQL string) string {
+	fromCols := parseCreateTableColumns(fromSQL)
+	toCols := parseCreateTableColumns(toSQL)
+
+	var sb strings.Builder
+
+	for _, fc := range fromCols {
+		if findCol(toCols, fc.name) == nil {
+			fmt.Fprintf(&sb, "ALTER TABLE \"%s\" DROP COLUMN \"%s\";\n", table, fc.name)
+		}
+	}
+	for _, tc := range toCols {
+		if findCol(fromCols, tc.name) == nil {
+			fmt.Fprintf(&sb, "ALTER TABLE \"%s\" ADD COLUMN \"%s\" %s;\n", table, tc.name, tc.def)
+		}
+	}
+	for _, fc := range fromCols {
+		if tc := findCol(toCols, fc.name); tc != nil && tc.def != fc.def {
+			fmt.Fprintf(&sb,
+				"/* schema-replay: type change for \"%s\".\"%s\": %q -> %q "+
+					"(emit ALTER COLUMN or temp-table rebuild manually if needed) */\n",
+				table, fc.name, fc.def, tc.def)
+		}
+	}
+	return sb.String()
+}
+
+// doltliteToSchemaCols returns the column-name list of the table's schema
+// AT the child commit. Strategy: query dolt_schema_diff for the parent→
+// child pair; if a row is returned, parse to_create_statement. If no row
+// (schema unchanged in this commit), fall back to a (root → child) diff
+// which always returns a row when the table exists at child. Returns
+// empty slice if the table doesn't exist at child.
+func doltliteToSchemaCols(db, parent, child, table string) ([]string, error) {
+	q := fmt.Sprintf(
+		"SELECT to_create_statement FROM dolt_schema_diff "+
+			"WHERE from_ref='%s' AND to_ref='%s' AND table_name='%s'",
+		parent, child, table)
+	out, _, err := run("", "", "doltlite", "-csv", "-header", db, q)
+	if err != nil {
+		return nil, err
+	}
+	cr := csv.NewReader(strings.NewReader(out))
+	cr.FieldsPerRecord = -1
+	rows, _ := cr.ReadAll()
+	if len(rows) >= 2 && strings.TrimSpace(rows[1][0]) != "" {
+		cols := parseCreateTableColumns(rows[1][0])
+		out := make([]string, 0, len(cols))
+		for _, c := range cols {
+			out = append(out, c.name)
+		}
+		return out, nil
+	}
+	// Schema unchanged in (parent, child). Diff against root commit to
+	// recover the schema at child. dolt_log ORDER BY date LIMIT 1 returns
+	// the chronologically-first commit (the auto Initialize).
+	rootOut, _, err := run("", "", "doltlite", "-csv", "-header", db,
+		"SELECT commit_hash FROM dolt_log ORDER BY date LIMIT 1")
+	if err != nil {
+		return nil, err
+	}
+	cr2 := csv.NewReader(strings.NewReader(rootOut))
+	rrows, _ := cr2.ReadAll()
+	if len(rrows) < 2 {
+		return nil, nil
+	}
+	root := strings.TrimSpace(rrows[1][0])
+	q2 := fmt.Sprintf(
+		"SELECT to_create_statement FROM dolt_schema_diff "+
+			"WHERE from_ref='%s' AND to_ref='%s' AND table_name='%s'",
+		root, child, table)
+	out2, _, err := run("", "", "doltlite", "-csv", "-header", db, q2)
+	if err != nil {
+		return nil, err
+	}
+	cr3 := csv.NewReader(strings.NewReader(out2))
+	cr3.FieldsPerRecord = -1
+	rows2, _ := cr3.ReadAll()
+	if len(rows2) >= 2 && strings.TrimSpace(rows2[1][0]) != "" {
+		cols := parseCreateTableColumns(rows2[1][0])
+		out := make([]string, 0, len(cols))
+		for _, c := range cols {
+			out = append(out, c.name)
+		}
+		return out, nil
+	}
+	return nil, nil
+}
+
+func doltliteDiffSQL(db, parent, child, table string) (string, error) {
+	// First emit schema-level changes (ALTERs for added/dropped columns)
+	// derived from dolt_schema_diff. Empty when schemas match.
+	schemaSQL, err := doltliteSchemaChangeSQL(db, parent, child, table)
+	if err != nil {
 		return "", err
 	}
-	cols := make([]string, 0, len(rows)-1)
-	for _, r := range rows[1:] {
-		cols = append(cols, r[0])
+
+	// Determine the to-schema column list AT THIS COMMIT, not the
+	// current/latest schema. pragma_table_info returns columns of the
+	// table as it exists right now, which after later schema migrations
+	// includes columns that didn't exist at this commit — emitting
+	// INSERTs against them would fail on the target.
+	//
+	// dolt_schema_diff(parent → child) gives us the to_create_statement
+	// when the schema changed; parse its column list. When schema didn't
+	// change between parent and child, the column list at child equals
+	// the column list at parent — but we don't have that handy without
+	// either accumulating state across commits or doing a separate
+	// "(initial → child)" diff. The simplest correct fallback is the
+	// latter.
+	cols, err := doltliteToSchemaCols(db, parent, child, table)
+	if err != nil {
+		return "", err
+	}
+	if len(cols) == 0 {
+		// Fall back to current pragma — schema unchanged across all
+		// history we can see, so current schema is correct.
+		colsOut, _, err := run("", "", "doltlite", "-csv", "-header", db,
+			fmt.Sprintf("SELECT name FROM pragma_table_info('%s')", table))
+		if err != nil {
+			return "", err
+		}
+		cr := csv.NewReader(strings.NewReader(colsOut))
+		rows, err := cr.ReadAll()
+		if err != nil || len(rows) < 2 {
+			return "", err
+		}
+		for _, r := range rows[1:] {
+			cols = append(cols, r[0])
+		}
 	}
 
 	dq := fmt.Sprintf("SELECT * FROM dolt_diff_%s WHERE to_commit='%s' AND from_commit='%s'", table, child, parent)
@@ -298,7 +546,10 @@ func doltliteDiffSQL(db, parent, child, table string) (string, error) {
 				table, strings.Join(sets, ","), strings.Join(where, " AND "))
 		}
 	}
-	return sb.String(), nil
+	// Emit schema changes first so the data DML below applies against
+	// the to-schema. ALTERs that drop columns must run before any
+	// INSERTs that omit the dropped column from the column list, etc.
+	return schemaSQL + sb.String(), nil
 }
 
 // ---------- SQL dialect translator ----------
