@@ -1,29 +1,31 @@
 # Known Issues
 
-## Upstream dolt: `dolt diff -r sql` drops data when commit also has schema changes
+## ✅ Fixed locally (commit 367929a): silent-skip on combined schema+data commits
 
-**Repro**: take any commit that includes both `ALTER TABLE X ADD COLUMN`
-and significant row churn on `X` (e.g. the bahaiwritings `uibsgeher`
-"Rebuild prayer_book_structure" commit: ALTERs + 5,123 DELETEs +
-2,325 INSERTs).
+**Was:** any commit that includes both `ALTER TABLE X` and row churn on
+`X` had the row-level DELETE/INSERT/UPDATE statements silently dropped
+by `dolt diff -r sql`. On bahaiwritings, this caused
+`prayer_book_structure` to end up +4,952 rows (29% over source).
 
-- `dolt diff --stat <parent> <commit>` reports the row counts correctly.
-- `dolt diff -r sql <parent> <commit>` emits **only** the ALTERs — every
-  DELETE/INSERT/UPDATE row-level statement is silently swallowed.
+**Fix:** `doltDiffSQLViaRebase` (commit 367929a) — when `dolt diff -r sql`
+writes `Incompatible schema change, skipping data diff` to stderr, the
+tool branches from parent into `__replay_baseline`, applies the schema
+delta, then diffs `__replay_baseline → child --data`. Schemas match by
+construction, so the upstream guard no longer fires and the DML emits.
 
-**Impact on bahaiwritings clone**: `prayer_book_structure` ends up +4,952
-rows (29% over source) — almost exactly the 5,123 DELETEs the rebuild
-commit dropped. Tables without combined-schema-and-data commits clone
-byte-for-byte (`inventory`, `languages`, ...).
+This is exactly the "schema-then-diff-against-rebased-baseline" approach
+proposed by nicktobey upstream in dolthub/dolt#10988. The test matrix
+(48 cells in `schema_replay_test.go`, including nicktobey's case 1 +
+case 2 + the bahaiwritings shape) now passes 100%. Round-trip
+integration check on the actual bahaiwritings 482-commit history is
+running at the time of writing; results will land in
+`/tmp/bahaiwritings-replay/compare.log`.
 
-**Workarounds** (none implemented):
-1. After a commit that contains an `ALTER TABLE X …`, re-sync `X` rows
-   (delete-where-not-in-source plus insert-where-not-in-target). Heavy.
-2. Use `dolt sql -q "SELECT * FROM dolt_diff_X AS OF '<commit>'"` to
-   read deltas independently of the SQL emitter; would need a row→SQL
-   translator.
-3. File upstream — failure mode is in the SQL emitter, not the stored
-   delta (`--stat` sees the rows fine).
+Upstream conversation:
+- dolthub/dolt#10988 — algorithm + worked examples + test spec for the
+  upstream fix (consumer-side workaround vs. proper diff-time fix).
+- dolthub/doltlite#738/#739/#740 — companion gaps in doltlite's system
+  tables that the work surfaced.
 
 ## Local: `INSERT OR IGNORE` in PK rebuild drops NOT-NULL-violating rows
 
@@ -38,23 +40,26 @@ UUIDs in the rebuild SELECT — source did this implicitly via dolt's MySQL
 the literal string `'uuid()'` because it doesn't recognize the function
 form, so the default never fires for backfill.
 
-## SQLite/doltlite DDL gaps (full-clone limitation)
+## SQLite/doltlite DDL gaps (partial coverage)
 
 When replaying `dolt → doltlite`, several MySQL DDLs have no direct
-SQLite/doltlite equivalent and require a full table rebuild (CREATE
-new table, copy data, DROP old, RENAME). dolt-replay currently
-**skips** these statements with an inline `-- skipped` comment so the
-walk doesn't halt, but the schema then drifts from source:
+SQLite/doltlite equivalent. The schema-replay test suite covers the
+type-change shapes via the SQLite table-rebuild pattern (CREATE new
+table, copy data, DROP old, RENAME). The remaining shapes still skip
+with an inline `-- skipped` comment:
 
-- `ALTER TABLE … MODIFY COLUMN …`
-- `ALTER TABLE … DROP PRIMARY KEY` / `ADD PRIMARY KEY`
+- `ALTER TABLE … MODIFY COLUMN …` — covered for tests via the rebuild
+  pattern in `schema_replay_test.go`. Real source repos that emit
+  MODIFY directly still skip; would need detection-and-rewrite to
+  the rebuild pattern in the dialect translator.
+- `ALTER TABLE … DROP PRIMARY KEY` / `ADD PRIMARY KEY` — partially
+  handled by the PK-rebuild path in `applyToDoltlite`.
 - `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY …`
 - `ALTER TABLE … DROP COLUMN <pk_col>` (errors at apply time;
   surfaces as a `--continue-on-error` failure rather than a silent skip)
 
 For a faithful clone, run with `--continue-on-error` and audit the
-final schema against `dolt --schema-only dump` of the source. A future
-version could implement schema-rebuild emulation for these cases.
+final schema against `dolt --schema-only dump` of the source.
 
 ## ✅ Fixed in doltlite v0.9.1
 
