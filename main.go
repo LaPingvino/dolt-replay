@@ -334,46 +334,6 @@ func doltliteLog(db string, limit int) ([]Commit, error) {
 // CREATE TABLE statements) and `dolt_diff_<table>` (per-row data delta)
 // as system tables, which is the cleaner shape — we just need to use
 // them together.
-// doltliteCreateAtCommit fetches the to_create_statement of the table
-// at the given commit by querying dolt_schema_diff anchored on the
-// repo's root commit. Returns "" when the table doesn't exist there.
-// Used as a fallback when a pair-anchored dolt_schema_diff returns
-// `unknown operation`.
-func doltliteCreateAtCommit(db, commit, table string) (string, error) {
-	// Pin to the auto-init commit by message. `ORDER BY date LIMIT 1`
-	// is unreliable here because doltlite's dates are second-resolution
-	// and the user's first dolt_commit can land in the same second as
-	// the auto-init, shuffling the sort and returning the wrong root.
-	rootOut, _, err := run("", "", "doltlite", "-csv", "-header", db,
-		"SELECT commit_hash FROM dolt_log WHERE message='Initialize data repository' ORDER BY date LIMIT 1")
-	if err != nil {
-		return "", err
-	}
-	cr := csv.NewReader(strings.NewReader(rootOut))
-	rrows, _ := cr.ReadAll()
-	if len(rrows) < 2 {
-		return "", nil
-	}
-	root := strings.TrimSpace(rrows[1][0])
-	if root == commit {
-		return "", nil
-	}
-	q := fmt.Sprintf(
-		"SELECT to_create_statement FROM dolt_schema_diff "+
-			"WHERE from_ref='%s' AND to_ref='%s' AND table_name='%s'",
-		root, commit, table)
-	out, _, err := run("", "", "doltlite", "-csv", "-header", db, q)
-	if err != nil {
-		return "", err
-	}
-	cr2 := csv.NewReader(strings.NewReader(out))
-	cr2.FieldsPerRecord = -1
-	rows, _ := cr2.ReadAll()
-	if len(rows) < 2 {
-		return "", nil
-	}
-	return strings.TrimSpace(rows[1][0]), nil
-}
 
 func doltliteSchemaChangeSQL(db, parent, child, table string) (string, error) {
 	q := fmt.Sprintf(
