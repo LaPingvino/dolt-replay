@@ -299,6 +299,20 @@ func doltliteLog(db string, limit int) ([]Commit, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The auto-init "Initialize data repository" commit is the root by
+	// definition. Date-sort can place it elsewhere if a replayed commit
+	// carries an earlier --date (e.g. cross-format chain replays where
+	// the source's commit dates pre-date the target's auto-init). Move
+	// the Initialize commit to position 0 so the parent-chain logic
+	// below treats it correctly as the root.
+	for i, c := range cs {
+		if c.Message == "Initialize data repository" && i != 0 {
+			init := cs[i]
+			copy(cs[1:i+1], cs[0:i])
+			cs[0] = init
+			break
+		}
+	}
 	for i := range cs {
 		if i == 0 {
 			continue

@@ -1032,6 +1032,89 @@ CALL DOLT_COMMIT('-Am','drop column');`)
 		})
 }
 
+// TestReplayChain_DoltDoltliteDolt exercises a round trip through a
+// foreign format: dolt source → doltlite intermediate → dolt destination.
+// End state on the destination must byte-equal the source. This catches
+// any information loss in either direction (extraction or application).
+func TestReplayChain_DoltDoltliteDolt(t *testing.T) {
+	replayBin := requireDoltliteAndDolt(t)
+
+	// A1: build dolt source with the bahaiwritings shape — combined
+	// ALTER + DELETE + INSERT in one commit.
+	a1 := freshDoltDir(t)
+	doltSQLcheck(t, a1, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+CALL DOLT_COMMIT('-Am','seed');`)
+	// Spread commits across seconds so that hop1's doltlite intermediate
+	// (which records commit dates at second resolution — see doltlite#740)
+	// can still order them deterministically for hop2's walk.
+	dliteCommitSep(t)
+	doltSQLcheck(t, a1, `ALTER TABLE t ADD COLUMN extra TEXT;
+DELETE FROM t WHERE id IN (3,4,5);
+INSERT INTO t VALUES (6,'f',NULL),(7,'g',NULL);
+CALL DOLT_COMMIT('-Am','combined');`)
+
+	// Hop 1: A1 (dolt) → B1 (doltlite).
+	b1 := filepath.Join(t.TempDir(), "b1.dl")
+	out1, err := runReplayDoltToDoltlite(t, replayBin, a1, b1, "t")
+	if err != nil {
+		t.Fatalf("hop1 dolt→doltlite failed: %v\n%s", err, out1)
+	}
+
+	// Hop 2: B1 (doltlite) → A2 (dolt).
+	a2 := freshDoltDir(t)
+	out2, err := runReplayDoltliteToDolt(t, replayBin, b1, a2, "t")
+	if err != nil {
+		t.Fatalf("hop2 doltlite→dolt failed: %v\n%s", err, out2)
+	}
+
+	want := doltRows(t, a1, "t", "id")
+	got := doltRows(t, a2, "t", "id")
+	if !equalLines(want, got) {
+		t.Errorf("round-trip rows differ:\nA1: %v\nA2: %v\nhop1:\n%s\nhop2:\n%s",
+			want, got, out1, out2)
+	}
+}
+
+// TestReplayChain_DoltliteDoltliteDoltlite exercises a two-hop intra-
+// format round trip. Useful for migration scenarios across doltlite
+// version bumps where the same data passes through twice.
+func TestReplayChain_DoltliteDoltliteDoltlite(t *testing.T) {
+	replayBin := requireDoltliteOnly(t)
+
+	// C1: build doltlite source with combined schema+data commit.
+	c1 := freshDoltliteSrc(t, "c1.dl")
+	dliteSQLcheck(t, c1, `CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+SELECT dolt_commit('-Am','seed');`)
+	dliteCommitSep(t)
+	dliteSQLcheck(t, c1, `ALTER TABLE t ADD COLUMN extra TEXT;
+DELETE FROM t WHERE id IN (3,4,5);
+INSERT INTO t VALUES (6,'f',NULL),(7,'g',NULL);
+SELECT dolt_commit('-Am','combined');`)
+
+	// Hop 1: C1 → C2.
+	c2 := filepath.Join(t.TempDir(), "c2.dl")
+	out1, err := runReplayDoltliteToDoltlite(t, replayBin, c1, c2, "t")
+	if err != nil {
+		t.Fatalf("hop1 c1→c2 failed: %v\n%s", err, out1)
+	}
+
+	// Hop 2: C2 → C3.
+	c3 := filepath.Join(t.TempDir(), "c3.dl")
+	out2, err := runReplayDoltliteToDoltlite(t, replayBin, c2, c3, "t")
+	if err != nil {
+		t.Fatalf("hop2 c2→c3 failed: %v\n%s", err, out2)
+	}
+
+	want := dliteRows(t, c1, "t", "id")
+	got := dliteRows(t, c3, "t", "id")
+	if !equalLines(want, got) {
+		t.Errorf("two-hop rows differ:\nC1: %v\nC3: %v\nhop1:\n%s\nhop2:\n%s",
+			want, got, out1, out2)
+	}
+}
+
 func equalLines(a, b []string) bool {
 	if len(a) == 0 && len(b) == 0 {
 		return true
