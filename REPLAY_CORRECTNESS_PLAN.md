@@ -27,21 +27,36 @@ Each row is a case category. Each column is a (src-kind, dst-kind) pair. Cell va
 | MultiTable                  | ✅ | ✅ | ✅ | ✅ |
 | RowOrderingPreserved        | ✅ | ✅ | ✅ | ✅ |
 
+**48/48 cells green** as of commit 367929a. Round-trip chain tests
+(`TestReplayChain_DoltDoltliteDolt`, `TestReplayChain_DoltliteDoltliteDoltlite`)
+also pass — see commit cdcc1f6.
+
 Update this table after each loop tick.
 
-## Known Gaps (Why Some Cells Skip)
+## Status: workarounds in place, upstream fixes filed
 
-1. **dolthub/dolt#10988 case 1** (`AddWithDefault`): `dolt_diff_<table>` doesn't surface the schema-change commit's effect on existing rows. The ALTER's DEFAULT-population is invisible at the data-diff layer. The data-then-rebuild approach won't recover the value either; needs the **schema-then-diff-against-rebased-baseline** algorithm.
+All twelve cases pass on the consumer side via the workarounds documented here. The corresponding upstream fixes are filed and reference the consumer-side implementation:
 
-2. **dolthub/dolt#10988 case 2** (`DropThenAdd`): row-record positional aliasing. When `DROP COLUMN a; ADD COLUMN b INTEGER` happens and the new b's value matches the old a, dolt_diff/`<table>` reports nothing — the row's "shape" is the same. Needs the same algorithm fix as case 1.
+- **dolthub/dolt#10988** — silent-skip on combined schema-and-data commits. See [comment 4375376092](https://github.com/dolthub/dolt/issues/10988#issuecomment-4375376092) (consumer-side description) and [comment 4375380955](https://github.com/dolthub/dolt/issues/10988#issuecomment-4375380955) (upstream recommendation with worked examples + test spec).
+- **dolthub/doltlite#738** — `dolt_schema_diff` errors `unknown operation` on DROP TABLE.
+- **dolthub/doltlite#739** — `dolt_schema_diff` requires `table_name` filter to not error on certain change shapes.
+- **dolthub/doltlite#740** — no `dolt_commit_ancestors` view + second-resolution dates make commit ordering ambiguous.
 
-3. **doltliteLog date-sort** (main.go around line 197): doltlite doesn't expose `dolt_commit_ancestors` yet, so the log walker sorts by date with second-resolution timestamps. Commits inside the same second shuffle, breaking parent inference. Workaround in the test suite: `dliteCommitSep(t)` sleeps 1.1s between commits. Real fix: use a parent-aware traversal.
+## Workarounds active in main.go
 
-4. **RenameColumn (dlite-source)**: Now fully green. Two-part fix:
-   - **Schema layer**: `deriveAlterFromCreate` detects single-rename (one column dropped + one added at same position with matching def) and emits `ALTER TABLE ... RENAME COLUMN`.
-   - **Data layer**: When `dolt_diff_<table>`'s HEAD-aligned header has no `to_<schema-at-child-col>` field (because the column was renamed before HEAD), fall back to positional mapping against `pragma_table_info` at HEAD — schema-at-child[i] aligns with HEAD-col[i].
+1. **`doltDiffSQLViaRebase`** (commit 367929a) — when `dolt diff -r sql` writes `Incompatible schema change, skipping data diff` to stderr, branch from parent into `__replay_baseline`, apply the schema delta there, then diff baseline→child for data. Closes the case 1/case 2 algorithm gap from #10988.
 
-5. **dolt-source path silently drops data** on schema-change commits — same upstream bug as 1+2 viewed from the source side. `dolt diff -r sql` is what we use; it emits only the ALTER, never the data. Until the upstream fix lands, dolt→* tests will fail on schema-change commits unless we work around it ourselves.
+2. **Pragma-based DROP detector** (commit 8e06894) — when doltlite `dolt_schema_diff` errors `unknown operation` and the table doesn't appear in `pragma_table_info` at HEAD, emit `DROP TABLE` ourselves. Workaround for doltlite#738.
+
+3. **Rename detection in `deriveAlterFromCreate`** (commit bf90969) — single-drop + single-add at same position with matching def is emitted as `ALTER TABLE ... RENAME COLUMN`, preventing data loss across the schema migration.
+
+4. **Positional column mapping** (commit 5188a74) — when a schema-at-child column doesn't appear as `to_<col>` in the HEAD-aligned `dolt_diff_<table>` header (because the column was renamed before HEAD), fall back to position-matching against `pragma_table_info` at HEAD.
+
+5. **Initialize-anchored walker** (commit cdcc1f6) — `doltliteLog` moves the `Initialize data repository` commit to position 0 regardless of date sort. Required for chain replays where a source commit's preserved date can pre-date the target's auto-init. Partial workaround for doltlite#740.
+
+6. **`dliteCommitSep` test helper** (1.1s sleep between commits) — keeps test commits in distinct seconds. Workaround for doltlite#740.
+
+7. **Empty-commit tolerance in `applyToDolt`** — table-rebuild patterns produce no semantic dolt diff; tolerate `nothing to commit` and `no changes added to commit`.
 
 ## The Correct Algorithm (nicktobey, dolthub/dolt#10988)
 
