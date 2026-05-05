@@ -778,14 +778,60 @@ func doltliteDiffSQL(db, parent, child, table string) (string, error) {
 		name        string // emit name (schema-at-child)
 		toIx, frIx  int
 	}
-	var slots []colSlot
+
+	// Two-pass column mapping. First, satisfy direct name lookups
+	// (schema-at-child name == HEAD-aligned dolt_diff header column).
+	// Then, for schema-at-child cols that didn't match by name, try
+	// positional fallback against pragma_table_info(HEAD) — but only
+	// pair with HEAD cols *not* already claimed by a direct-name match.
+	// Without this guard, when the historical schema has columns that
+	// no longer exist at HEAD (e.g. `id` dropped before HEAD on
+	// bahaiwritings.writings), positional fallback collides with
+	// direct-match cols and the same `to_X` value gets emitted into
+	// multiple slots.
+	directlyUsed := map[int]bool{}
+	slotPlan := make([]colSlot, len(cols))
+	needsFallback := []int{}
 	for i, c := range cols {
 		ti, fi := headIdx(c)
-		if ti < 0 && fi < 0 && i < len(headCols) {
-			ti, fi = headIdx(headCols[i])
-		}
 		if ti >= 0 || fi >= 0 {
-			slots = append(slots, colSlot{name: c, toIx: ti, frIx: fi})
+			slotPlan[i] = colSlot{name: c, toIx: ti, frIx: fi}
+			if ti >= 0 {
+				directlyUsed[ti] = true
+			}
+			if fi >= 0 {
+				directlyUsed[fi] = true
+			}
+		} else {
+			needsFallback = append(needsFallback, i)
+		}
+	}
+	for _, i := range needsFallback {
+		if i >= len(headCols) {
+			continue
+		}
+		ti, fi := headIdx(headCols[i])
+		if directlyUsed[ti] {
+			ti = -1
+		}
+		if directlyUsed[fi] {
+			fi = -1
+		}
+		if ti < 0 && fi < 0 {
+			continue
+		}
+		slotPlan[i] = colSlot{name: cols[i], toIx: ti, frIx: fi}
+		if ti >= 0 {
+			directlyUsed[ti] = true
+		}
+		if fi >= 0 {
+			directlyUsed[fi] = true
+		}
+	}
+	var slots []colSlot
+	for _, s := range slotPlan {
+		if s.name != "" && (s.toIx >= 0 || s.frIx >= 0) {
+			slots = append(slots, s)
 		}
 	}
 

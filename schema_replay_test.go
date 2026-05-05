@@ -1032,6 +1032,31 @@ CALL DOLT_COMMIT('-Am','drop column');`)
 		})
 }
 
+// TestReplaySchema_DropColAfterDataInsert: source history with a column
+// that gets data inserted at C2, then dropped at C3. After replay
+// through a doltlite intermediate, the intermediate's HEAD-aligned
+// dolt_diff_<table> header has no `to_<dropped>` field, so the
+// dropped column's values are unrecoverable. The data-emitter must
+// not alias the dropped slot onto a same-positioned HEAD column —
+// it should skip it cleanly. End-state correctness on HEAD-resolved
+// columns is what we check.
+//
+// Without this guard, the bahaiwritings round-trip aliased `id` slot
+// onto `phelps`'s data and produced INSERTs like
+// `(id=BH10581, phelps=BH10581, ...)` that failed type validation
+// on dolt targets.
+func TestReplaySchema_DropColAfterDataInsert(t *testing.T) {
+	runBothDirections(t, "t", "name", []string{"a|x", "b|y"},
+		func(t *testing.T, src string) {
+			dliteSQLcheck(t, src, `CREATE TABLE t(name VARCHAR(16) PRIMARY KEY, extra TEXT, info TEXT);
+INSERT INTO t VALUES ('a','x','keepme'),('b','y','dropme');
+SELECT dolt_commit('-Am','seed with extra info col');`)
+			dliteCommitSep(t)
+			dliteSQLcheck(t, src, `ALTER TABLE t DROP COLUMN info;
+SELECT dolt_commit('-Am','drop info col');`)
+		})
+}
+
 // TestReplayChain_DoltDoltliteDolt exercises a round trip through a
 // foreign format: dolt source → doltlite intermediate → dolt destination.
 // End state on the destination must byte-equal the source. This catches
